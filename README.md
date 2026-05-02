@@ -9,9 +9,19 @@ Cliente CLI para Linux que te deja hablar con tu propio bot de Telegram desde la
 
 ## 1. Pre-requisitos
 
+Python **3.10 – 3.12** (en 3.13 todavía no hay wheels de `tflite-runtime`, dep transitiva de `openwakeword`).
+
+Debian/Ubuntu:
 ```bash
 sudo apt update
-sudo apt install -y ffmpeg portaudio19-dev python3-venv
+sudo apt install -y ffmpeg portaudio19-dev python3.12-venv
+```
+
+Arch (PipeWire ya viene compatible con PortAudio):
+```bash
+sudo pacman -Syu --needed ffmpeg portaudio git base-devel
+# Si tu `python` es 3.13, instala 3.12 desde AUR (`yay -S python312`)
+# o usa `uv` (https://astral.sh/uv) para gestionar la versión.
 ```
 
 Sacar credenciales de Telegram (una vez):
