@@ -483,11 +483,39 @@ async function playVoice(page, key) {
   const btnSel = `[data-tg-pending="${key}"] button, [data-tg-pending="${key}"] [role='button']`;
 
   async function clickRobust() {
+    // page.click() puede colgarse si el elemento no es "interactable" segun
+    // el heuristico de puppeteer; saltamos eso usando page.mouse.click sobre
+    // las coordenadas del boundingBox. page.mouse.click pasa por CDP
+    // Input.dispatchMouseEvent -> isTrusted=true.
+    const doClick = async () => {
+      const handle = await page.$(btnSel);
+      if (!handle) throw new Error("selector no encontrado");
+      try {
+        // Asegurar que esta visible.
+        await handle.evaluate((el) =>
+          el.scrollIntoView({ block: "center", inline: "center", behavior: "auto" })
+        );
+        const box = await handle.boundingBox();
+        if (!box) throw new Error("sin boundingBox (no visible)");
+        await page.mouse.click(
+          box.x + box.width / 2,
+          box.y + box.height / 2,
+          { delay: 30 }
+        );
+      } finally {
+        await handle.dispose().catch(() => {});
+      }
+    };
+
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("timeout 5s")), 5000)
+    );
+
     try {
-      await page.click(btnSel, { delay: 30, timeout: 5000 });
+      await Promise.race([doClick(), timeout]);
       return true;
     } catch (e) {
-      lastAudioEvent = `${keyShort}: click fallo (${(e.message || "").slice(0, 40)})`;
+      lastAudioEvent = `${keyShort}: click fallo (${(e.message || "").slice(0, 50)})`;
       renderCliShell(currentInputPreview);
       return false;
     }
