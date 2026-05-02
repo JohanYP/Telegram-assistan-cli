@@ -7,28 +7,20 @@ const { spawn, execSync } = require("child_process");
 const puppeteer = require("puppeteer");
 
 const TELEGRAM_WEB_URL = "https://web.telegram.org/a/";
-const TELEGRAM_CHAT_URL =
-  process.env.TELEGRAM_CHAT_URL || "https://web.telegram.org/a/#8489015629";
 const USER_DATA_DIR = path.join(__dirname, "..", ".telegram-session");
+const CHAT_CONFIG_PATH = path.join(USER_DATA_DIR, "chat-config.json");
 const POLL_INTERVAL_MS = 1200;
-const BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME || "IL_assistantbot";
-const HEADLESS = process.env.HEADLESS !== "0";
-const ENABLE_SYSTEM_AUDIO_FALLBACK =
-  process.env.ENABLE_SYSTEM_AUDIO_FALLBACK === "1" ||
-  (process.env.ENABLE_SYSTEM_AUDIO_FALLBACK !== "0" && HEADLESS);
-const VOICE_WAKE_ENABLED = false;
-const AUDIO_INPUT_DEVICE = process.env.AUDIO_INPUT_DEVICE || "default";
-const VOICE_CHUNK_SECONDS = Number(process.env.VOICE_CHUNK_SECONDS || 3);
-const VOICE_SILENCE_CHUNKS_TO_SEND = Number(process.env.VOICE_SILENCE_CHUNKS_TO_SEND || 2);
+const HEADLESS_OVERRIDE = process.env.HEADLESS;
+const ENABLE_SYSTEM_AUDIO_FALLBACK_ENV = process.env.ENABLE_SYSTEM_AUDIO_FALLBACK;
 
-const seenIds = new Set();
-const playedAudioUrls = new Set();
-
+let seenIds = new Set();
+let playedAudioUrls = new Set();
 let sessionArmed = false;
 let waitingBotReply = false;
 let lastBotResponse = "Aun sin respuesta.";
-let lastVoiceEvent = "Sin audio reciente.";
+let lastAudioEvent = "Sin audio reciente.";
 let currentInputPreview = "";
+let currentChatName = "Sin chat seleccionado";
 
 function detectPlayer() {
   const candidates = [
@@ -53,123 +45,33 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function normalizeForMatch(text) {
-  return (text || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function compactForMatch(text) {
-  return normalizeForMatch(text).replace(/\s+/g, "");
-}
-
-function runCommand(command, args = []) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: "ignore" });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`${command} finalizo con codigo ${code}`));
-    });
-  });
-}
-
-function findWakeWordInTranscript(transcript) {
-  const normalized = normalizeForMatch(transcript);
-  const compact = compactForMatch(transcript);
-  for (const wake of WAKE_WORD_KEYS) {
-    if (!wake) continue;
-    if (normalized.includes(wake) || compact.includes(compactForMatch(wake))) {
-      return wake;
-    }
+function loadChatConfig() {
+  try {
+    const raw = fs.readFileSync(CHAT_CONFIG_PATH, "utf8");
+    const data = JSON.parse(raw);
+    if (data && typeof data.url === "string" && data.url.length > 0) return data;
+  } catch (_) {
+    // sin config
   }
-  return "";
+  return null;
 }
 
-async function recordVoiceChunk(outputPath, seconds) {
-  await runCommand("ffmpeg", [
-    "-y",
-    "-f",
-    "pulse",
-    "-i",
-    AUDIO_INPUT_DEVICE,
-    "-ac",
-    "1",
-    "-ar",
-    "16000",
-    "-t",
-    String(seconds),
-    "-loglevel",
-    "error",
-    outputPath,
-  ]);
+function saveChatConfig(cfg) {
+  fs.mkdirSync(path.dirname(CHAT_CONFIG_PATH), { recursive: true });
+  fs.writeFileSync(CHAT_CONFIG_PATH, JSON.stringify(cfg, null, 2));
 }
 
-async function transcribeWithGroq(audioPath) {
-  if (!GROQ_API_KEY) return "";
-  const audioBuffer = await fs.promises.readFile(audioPath);
-  const form = new FormData();
-  form.append("model", GROQ_WHISPER_MODEL);
-  form.append("language", "es");
-  form.append("response_format", "text");
-  form.append("file", new Blob([audioBuffer], { type: "audio/wav" }), "voice.wav");
-
-  const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${GROQ_API_KEY}`,
-    },
-    body: form,
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => "sin detalle");
-    throw new Error(`Transcripcion fallo (${response.status}): ${errText}`);
-  }
-  const raw = await response.text();
-  const ct = (response.headers.get("content-type") || "").toLowerCase();
-  if (ct.includes("application/json")) {
-    try {
-      const data = JSON.parse(raw);
-      return (data.text || "").trim();
-    } catch (_) {
-      return raw.trim();
-    }
-  }
-  return raw.trim();
+async function clearAllSession() {
+  await fs.promises.rm(USER_DATA_DIR, { recursive: true, force: true });
 }
 
-function createSpinner() {
-  let active = false;
-  let text = "";
-
-  return {
-    start(nextText) {
-      text = nextText;
-      active = true;
-      renderCliShell(currentInputPreview, `● ${text}`);
-    },
-    stop(finalText = "") {
-      active = false;
-      if (finalText) {
-        lastVoiceEvent = finalText;
-      }
-      renderCliShell(currentInputPreview);
-    },
-    active() {
-      return active;
-    },
-  };
+function getTerminalWidth() {
+  const cols = process.stdout.columns || 80;
+  return Math.max(50, Math.min(cols, 140));
 }
 
-function clearTerminalLine() {
-  process.stdout.write("\r");
-  process.stdout.write(" ".repeat(120));
-  process.stdout.write("\r");
+function getTerminalHeight() {
+  return Math.max(15, process.stdout.rows || 24);
 }
 
 function wrapText(text, width) {
@@ -192,14 +94,14 @@ function wrapText(text, width) {
   return lines.length ? lines : [""];
 }
 
-function buildBox(title, content, width = 76, minRows = 4) {
-  const innerWidth = width - 4;
-  const titleLabel = ` ${title} `;
+function buildBox(title, content, width, minRows = 4, maxRows = 8) {
+  const innerWidth = Math.max(10, width - 4);
+  const titleLabel = ` ${title} `.slice(0, innerWidth);
   const titlePad = Math.max(0, innerWidth - titleLabel.length);
   const top = `╔═${titleLabel}${"═".repeat(titlePad)}╗`;
   const bottom = `╚${"═".repeat(width - 2)}╝`;
 
-  const textLines = wrapText(content, innerWidth).slice(0, 8);
+  const textLines = wrapText(content, innerWidth).slice(0, maxRows);
   while (textLines.length < minRows) textLines.push("");
   const body = textLines.map((line) => `║ ${line.padEnd(innerWidth)} ║`);
   return [top, ...body, bottom];
@@ -212,21 +114,6 @@ function centerText(text, width) {
   return `${" ".repeat(left)}${text}${" ".repeat(right)}`;
 }
 
-function normalizeAsciiBlock(lines) {
-  const cleaned = lines.map((line) => line.replace(/\s+$/g, ""));
-  const nonEmpty = cleaned.filter((line) => line.trim().length > 0);
-  if (!nonEmpty.length) return cleaned;
-
-  const minIndent = Math.min(
-    ...nonEmpty.map((line) => {
-      const match = line.match(/^(\s*)/);
-      return match ? match[1].length : 0;
-    })
-  );
-
-  return cleaned.map((line) => line.slice(minIndent));
-}
-
 const IL_TITLE_ART = [
   "██╗██╗         █████╗ ███████╗███████╗██╗███████╗████████╗ █████╗ ███╗   ██╗████████╗",
   "██║██║        ██╔══██╗██╔════╝██╔════╝██║██╔════╝╚══██╔══╝██╔══██╗████╗  ██║╚══██╔══╝",
@@ -236,21 +123,25 @@ const IL_TITLE_ART = [
   "╚═╝╚══════╝   ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝   ",
 ];
 
+const IL_TITLE_COMPACT = ["━━━━[  iL  ASSISTANT  ]━━━━"];
+
 const IL_BOT_ICON = [
-  "                    █████████████████████████                    ",
-  "                    █████████████████████████                    ",
-  "                    ██████   ███████   ██████                    ",
-  "                    ██████   ███████   ██████                    ",
-  "          ███████████████████████████████████████████          ",
-  "          ███████████████████████████████████████████          ",
-  "                    █████████████████████████                    ",
-  "                    █████████████████████████                    ",
-  "                    ███   ███      ███    ███                    ",
-  "                    ███   ███      ███    ███                    ",
+  "█████████████████████████",
+  "█████████████████████████",
+  "██████   ███████   ██████",
+  "██████   ███████   ██████",
+  "█████████████████████████",
+  "█████████████████████████",
+  "███   ███     ███    ███ ",
+  "███   ███     ███    ███ ",
 ];
 
 function renderCliShell(inputValue = "", spinnerText = "") {
-  const width = 100;
+  const width = getTerminalWidth();
+  const height = getTerminalHeight();
+  const showFullBanner = width >= 90;
+  const showBotIcon = width >= 60 && height >= 32;
+
   const now = new Date().toLocaleString("es-CO", {
     hour12: true,
     year: "numeric",
@@ -260,30 +151,46 @@ function renderCliShell(inputValue = "", spinnerText = "") {
     minute: "2-digit",
     second: "2-digit",
   });
+
   const panelTop = "┌" + "─".repeat(width - 2) + "┐";
   const panelBottom = "└" + "─".repeat(width - 2) + "┘";
+
+  const titleLines = showFullBanner ? IL_TITLE_ART : IL_TITLE_COMPACT;
   const banner = [
     panelTop,
-    ...IL_TITLE_ART.map((line) => `│${centerText(line, width - 2)}│`),
+    ...titleLines.map((line) => `│${centerText(line, width - 2)}│`),
     panelBottom,
-    "",
-    ...IL_BOT_ICON,
-    "",
-    centerText(`Timestamp: ${now}`, width),
-    "",
   ];
 
-  const responseBox = buildBox("✦ RESPUESTA // IL ASSISTANT", lastBotResponse, width, 5);
+  if (showBotIcon) {
+    banner.push("");
+    banner.push(...IL_BOT_ICON.map((line) => centerText(line, width)));
+  }
+
+  banner.push("");
+  banner.push(centerText(`Chat: ${currentChatName}`, width));
+  banner.push(centerText(`Timestamp: ${now}`, width));
+  banner.push("");
+
+  const responseBox = buildBox("✦ RESPUESTA // IL ASSISTANT", lastBotResponse, width, 4);
+  const audioBox = buildBox("♪ AUDIO", lastAudioEvent, width, 1, 2);
   const statusText = waitingBotReply
     ? spinnerText || "Procesando respuesta del bot..."
-    : "En espera. Escribe tu mensaje y presiona Enter.";
-  const inputBox = buildBox("⌨ COMANDO", inputValue || " ", width, 3);
-  const statusLine = `● Estado del nucleo: ${statusText}`;
+    : "Listo. Enter para enviar. /logout cerrar sesion. /salir terminar.";
+  const inputBox = buildBox("⌨ COMANDO", inputValue || " ", width, 1, 3);
+  const statusLine = `● Estado: ${statusText}`.slice(0, width);
 
   process.stdout.write("\x1Bc");
-  [...banner, "", ...responseBox, "", ...inputBox, "", statusLine].forEach(
-    (line) => console.log(line)
-  );
+  [
+    ...banner,
+    ...responseBox,
+    "",
+    ...audioBox,
+    "",
+    ...inputBox,
+    "",
+    statusLine,
+  ].forEach((line) => console.log(line));
 }
 
 async function ensureSessionDir() {
@@ -298,85 +205,134 @@ async function isChatOpen(page) {
   });
 }
 
-async function tryOpenByDirectUrl(page) {
-  await page.goto(TELEGRAM_CHAT_URL, { waitUntil: "networkidle2" });
-  await page.waitForSelector("body");
-
-  for (let i = 0; i < 12; i += 1) {
+async function waitForChatOpen(page, timeoutMs = 15000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
     if (await isChatOpen(page)) return true;
-    await wait(500);
+    await wait(300);
   }
   return false;
 }
 
-async function openBotChat(page, botUsername) {
-  console.log("Abriendo chat directamente por URL:", TELEGRAM_CHAT_URL);
-  const openedByUrl = await tryOpenByDirectUrl(page);
-  if (openedByUrl) {
-    console.log(`Chat abierto (via URL directa).`);
-    return;
-  }
-
-  console.log("No se abrio el chat por URL. Intentando por buscador...");
-  await page.goto(TELEGRAM_WEB_URL, { waitUntil: "networkidle2" });
-  await page.waitForSelector("body");
-
+async function waitForChatList(page) {
   await page.waitForFunction(
-    () => !!document.querySelector(".ChatList") || !!document.querySelector(".chat-list"),
+    () =>
+      !!document.querySelector(
+        ".ChatList, .chat-list, #LeftColumn-main .ChatFolders, [data-test='chat-list']"
+      ),
     { timeout: 0 }
   );
+}
 
-  const searchSelectors = [
-    'input[placeholder*="Search"]',
-    'input[placeholder*="Buscar"]',
-    ".SearchInput input",
-    ".search-input-container input",
-    "[contenteditable='true'][role='searchbox']",
-  ];
+async function listAvailableChats(page) {
+  return page.evaluate(() => {
+    document
+      .querySelectorAll("[data-il-idx]")
+      .forEach((el) => el.removeAttribute("data-il-idx"));
 
-  let foundSelector = null;
-  for (const selector of searchSelectors) {
-    if (await page.$(selector)) {
-      foundSelector = selector;
-      break;
+    const candidates = Array.from(
+      document.querySelectorAll(
+        ".ChatList .Chat, .ChatList .ListItem, .chat-list .ListItem, .chat-list-item, .chatlist-chat, [role='listitem']"
+      )
+    );
+
+    const chats = [];
+    const seen = new Set();
+    let idx = 0;
+
+    for (const node of candidates) {
+      const titleEl = node.querySelector(
+        ".title, .fullName, .user-title, .chat-title, .peer-title, .ListItem-button .fullName, h3"
+      );
+      let title =
+        (titleEl?.textContent || node.getAttribute("aria-label") || "").trim();
+      title = title.replace(/\s+/g, " ").slice(0, 60);
+      if (!title) continue;
+      if (seen.has(title)) continue;
+      seen.add(title);
+
+      node.setAttribute("data-il-idx", String(idx));
+      chats.push({ idx, title });
+      idx += 1;
+      if (chats.length >= 50) break;
     }
+    return chats;
+  });
+}
+
+async function clickChatByIndex(page, idx) {
+  return page.evaluate((i) => {
+    const node = document.querySelector(`[data-il-idx="${i}"]`);
+    if (!node) return false;
+    node.scrollIntoView?.({ block: "center", behavior: "auto" });
+    node.click();
+    return true;
+  }, idx);
+}
+
+function askLine(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    rl.question(question, (ans) => {
+      rl.close();
+      resolve(ans.trim());
+    });
+  });
+}
+
+async function askChoice(prompt, min, max) {
+  while (true) {
+    const ans = await askLine(prompt);
+    const n = parseInt(ans, 10);
+    if (Number.isFinite(n) && n >= min && n <= max) return n;
+    console.log(`Valor invalido. Debe estar entre ${min} y ${max}.`);
+  }
+}
+
+async function onboardChat(page) {
+  process.stdout.write("\x1Bc");
+  console.log("=== PRIMER ARRANQUE / SELECCION DE CHAT ===\n");
+  console.log("Abriendo Telegram Web. Inicia sesion escaneando el QR si hace falta.");
+  await page.goto(TELEGRAM_WEB_URL, { waitUntil: "domcontentloaded" });
+  console.log("Esperando que cargue tu lista de chats...");
+  await waitForChatList(page);
+  await wait(1500);
+
+  const chats = await listAvailableChats(page);
+  if (!chats.length) {
+    throw new Error(
+      "No encontre ningun chat en la lista. Asegurate de tener chats en Telegram y vuelve a intentarlo."
+    );
   }
 
-  if (!foundSelector) {
-    throw new Error("No se encontro el buscador de chats en Telegram Web.");
-  }
+  console.log("\n=== CHATS DISPONIBLES ===");
+  chats.forEach((c) => console.log(`  ${String(c.idx + 1).padStart(2)}. ${c.title}`));
+  console.log("");
 
-  await page.click(foundSelector, { clickCount: 3 });
-  await page.keyboard.press("Backspace");
-  await page.type(foundSelector, `@${botUsername.replace(/^@/, "")}`, { delay: 40 });
-  await wait(1200);
+  const choice = await askChoice(`Elige un chat (1-${chats.length}): `, 1, chats.length);
+  const selected = chats[choice - 1];
+  console.log(`\nAbriendo: ${selected.title}...`);
 
-  const opened = await page.evaluate((username) => {
-    const normalized = username.replace(/^@/, "").toLowerCase();
-    const rows = Array.from(document.querySelectorAll("[role='row'], .chatlist-chat"));
-    for (const row of rows) {
-      const text = (row.textContent || "").toLowerCase();
-      if (text.includes(normalized)) {
-        row.click();
-        return true;
-      }
-    }
-    return false;
-  }, botUsername);
+  const ok = await clickChatByIndex(page, selected.idx);
+  if (!ok) throw new Error("No pude hacer click en el chat seleccionado.");
 
-  if (!opened) {
-    throw new Error(`No pude abrir el chat con ${botUsername}.`);
-  }
+  const opened = await waitForChatOpen(page, 15000);
+  if (!opened) throw new Error("Hice click pero el chat no se abrio.");
 
-  for (let i = 0; i < 6; i += 1) {
-    if (await isChatOpen(page)) break;
-    await wait(400);
-  }
+  await wait(800);
+  const url = page.url();
+  saveChatConfig({ url, name: selected.title });
+  console.log(`Chat "${selected.title}" guardado para futuras sesiones.\n`);
+  return { url, name: selected.title };
+}
 
-  if (!(await isChatOpen(page))) {
-    throw new Error(`Se encontro ${botUsername}, pero no quedo abierto el chat.`);
-  }
-  console.log(`Chat abierto con ${botUsername}.`);
+async function openSavedChat(page, chatConfig) {
+  await page.goto(chatConfig.url, { waitUntil: "domcontentloaded" });
+  const opened = await waitForChatOpen(page, 15000);
+  if (!opened) throw new Error("No pude abrir el chat guardado.");
 }
 
 async function sendMessage(page, text) {
@@ -406,7 +362,9 @@ async function readNewMessages(page) {
       const dataMessageId =
         node.getAttribute("data-message-id") || node.getAttribute("data-mid") || "";
       const id =
-        dataMessageId || node.id || `fallback-${idx}-${(node.textContent || "").slice(0, 30)}`;
+        dataMessageId ||
+        node.id ||
+        `fallback-${idx}-${(node.textContent || "").slice(0, 30)}`;
 
       const own =
         node.classList.contains("own") ||
@@ -419,7 +377,9 @@ async function readNewMessages(page) {
 
       const hasVoice =
         !!node.querySelector("audio") ||
-        !!node.querySelector(".voice-message, .media-inner audio, .is-voice, .Audio, .MediaVoice");
+        !!node.querySelector(
+          ".voice-message, .media-inner audio, .is-voice, .Audio, .MediaVoice"
+        );
 
       list.push({ id, own, text, hasVoice, dataMessageId });
     });
@@ -538,7 +498,6 @@ async function installAutoplayObserver(page) {
       return true;
     }
 
-    // Marca historico como procesado para no reproducir audios antiguos al arrancar.
     const initialMsgs = document.querySelectorAll("[data-message-id], .message");
     initialMsgs.forEach((m) => {
       if (!isIncomingVoiceMessage(m)) return;
@@ -606,7 +565,9 @@ async function installAudioInterceptor(page) {
       const file = path.join(os.tmpdir(), `tg-voice-${Date.now()}.ogg`);
       fs.writeFileSync(file, buf);
 
-      console.log(`Reproduciendo audio en tu PC (${SYSTEM_PLAYER.bin})...`);
+      lastAudioEvent = `Reproduciendo audio local (${SYSTEM_PLAYER.bin})...`;
+      renderCliShell(currentInputPreview);
+
       const child = spawn(SYSTEM_PLAYER.bin, [...SYSTEM_PLAYER.args, file], {
         stdio: "ignore",
         detached: true,
@@ -622,150 +583,51 @@ async function installAudioInterceptor(page) {
   });
 }
 
-function startVoiceWakeLoop({ submitMessage, spinner }) {
-  if (!VOICE_WAKE_ENABLED) return () => {};
-  if (!GROQ_API_KEY) {
-    lastVoiceEvent = "VOICE_WAKE activo pero falta GROQ_API_KEY.";
-    renderCliShell(currentInputPreview);
-    return () => {};
-  }
-
-  let stopRequested = false;
-  let wakeDetected = false;
-  let activeWakeWord = "";
-  let silenceCounter = 0;
-  let collectedChunks = [];
-
-  lastVoiceEvent = `Voz activa. Wake words: ${WAKE_WORDS.join(", ")}`;
-  renderCliShell(currentInputPreview);
-
-  (async () => {
-    while (!stopRequested) {
-      const tmpFile = path.join(os.tmpdir(), `il-voice-${Date.now()}.wav`);
-      try {
-        await recordVoiceChunk(tmpFile, VOICE_CHUNK_SECONDS);
-        const transcriptRaw = await transcribeWithGroq(tmpFile);
-        const transcript = normalizeForMatch(transcriptRaw);
-        if (!wakeDetected) {
-          lastVoiceEvent = transcriptRaw
-            ? `Oyendo (esperando wake): ${transcriptRaw}`
-            : "Oyendo (esperando wake): ...";
-          renderCliShell(currentInputPreview);
-        }
-
-        if (!wakeDetected) {
-          const matchedWake = findWakeWordInTranscript(transcript);
-          if (matchedWake) {
-            wakeDetected = true;
-            activeWakeWord = matchedWake;
-            silenceCounter = 0;
-            collectedChunks = [];
-            lastVoiceEvent = `Wake detectado (${matchedWake}). Te escucho...`;
-            renderCliShell(currentInputPreview);
-
-            const wakeIndex = transcript.indexOf(matchedWake);
-            const afterWake =
-              wakeIndex >= 0 ? transcript.slice(wakeIndex + matchedWake.length).trim() : "";
-            if (afterWake) {
-              collectedChunks.push(afterWake);
-            }
-          }
-          continue;
-        }
-
-        if (waitingBotReply) continue;
-
-        if (transcript.length > 0) {
-          silenceCounter = 0;
-          collectedChunks.push(transcript);
-          lastVoiceEvent = `Escuchando: ${transcriptRaw}`;
-          renderCliShell(currentInputPreview);
-        } else {
-          silenceCounter += 1;
-        }
-
-        if (silenceCounter >= VOICE_SILENCE_CHUNKS_TO_SEND) {
-          const finalMessage = collectedChunks.join(" ").trim();
-          wakeDetected = false;
-          silenceCounter = 0;
-          collectedChunks = [];
-
-          if (finalMessage) {
-            lastVoiceEvent = `Enviando voz: ${finalMessage}`;
-            renderCliShell(currentInputPreview);
-            await submitMessage(finalMessage, { source: "voice", spinner });
-            lastVoiceEvent = `Voz activa. Wake words: ${WAKE_WORDS.join(", ")}`;
-            renderCliShell(currentInputPreview);
-          } else {
-            lastVoiceEvent = `No detecte texto tras "${activeWakeWord || "wake word"}".`;
-            renderCliShell(currentInputPreview);
-          }
-          activeWakeWord = "";
-        }
-      } catch (err) {
-        lastVoiceEvent = `Error voz: ${err.message}`;
-        renderCliShell(currentInputPreview);
-        await wait(1000);
-      } finally {
-        fs.unlink(tmpFile, () => {});
-      }
-    }
-  })().catch(() => {});
-
-  return () => {
-    stopRequested = true;
+function createSpinner() {
+  return {
+    start(text) {
+      renderCliShell(currentInputPreview, `● ${text}`);
+    },
+    stop() {
+      renderCliShell(currentInputPreview);
+    },
   };
 }
 
-function startCli(onMessage) {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: "mensaje > ",
-  });
-  rl.prompt();
-  rl.on("line", async (line) => {
-    const text = line.trim();
-    if (!text) return rl.prompt();
-    if (text === "/salir") return rl.close();
-    currentInputPreview = text;
-    renderCliShell(currentInputPreview);
-    try {
-      await onMessage(text);
-    } catch (err) {
-      console.error("Error al enviar:", err.message);
-    }
-    if (!waitingBotReply) rl.prompt();
-  });
-  rl.on("close", () => {
-    console.log("Cerrando CLI...");
-    process.exit(0);
-  });
-  return rl;
-}
+async function runSession() {
+  seenIds = new Set();
+  playedAudioUrls = new Set();
+  sessionArmed = false;
+  waitingBotReply = false;
+  lastBotResponse = "Aun sin respuesta.";
+  lastAudioEvent = "Sin audio reciente.";
+  currentInputPreview = "";
+  currentChatName = "Sin chat seleccionado";
 
-async function main() {
   await ensureSessionDir();
-  const spinner = createSpinner();
 
-  if (SYSTEM_PLAYER && ENABLE_SYSTEM_AUDIO_FALLBACK) {
-    console.log(`Reproductor de audio de sistema detectado: ${SYSTEM_PLAYER.bin}`);
-    console.log("Audio local ACTIVADO (ffplay/mpv/paplay).");
-    if (HEADLESS) {
-      console.log("Modo headless: la reproduccion se hara por audio local.");
-    } else {
-      console.log("Modo visible: puede duplicar si Telegram tambien reproduce.");
-    }
-  } else if (SYSTEM_PLAYER) {
-    console.log("Fallback de audio local desactivado. Solo se reproducira desde Telegram Web.");
-  } else {
+  let chatConfig = loadChatConfig();
+  const isFirstTime = !chatConfig;
+
+  let headless;
+  if (HEADLESS_OVERRIDE === "0") headless = false;
+  else if (HEADLESS_OVERRIDE === "1") headless = true;
+  else headless = !isFirstTime;
+
+  const enableAudioFallback =
+    ENABLE_SYSTEM_AUDIO_FALLBACK_ENV === "1" ||
+    (ENABLE_SYSTEM_AUDIO_FALLBACK_ENV !== "0" && headless);
+
+  if (SYSTEM_PLAYER && enableAudioFallback) {
+    console.log(`Reproductor de audio detectado: ${SYSTEM_PLAYER.bin}. Audio local activado.`);
+  } else if (!SYSTEM_PLAYER && headless) {
     console.log(
-      "No se detecto ffplay/mpv/paplay. Solo se intentara reproducir en el navegador."
+      "Aviso: estas en headless y no se detecto ffplay/mpv/paplay. Los audios solo sonarian desde el navegador (no audible)."
     );
   }
 
   const browser = await puppeteer.launch({
-    headless: HEADLESS,
+    headless,
     userDataDir: USER_DATA_DIR,
     defaultViewport: null,
     args: [
@@ -779,85 +641,177 @@ async function main() {
   const page = pages[0] || (await browser.newPage());
 
   try {
-    if (ENABLE_SYSTEM_AUDIO_FALLBACK) {
-      await installAudioInterceptor(page);
+    if (enableAudioFallback) await installAudioInterceptor(page);
+
+    if (chatConfig) {
+      console.log(`Abriendo chat guardado: ${chatConfig.name}`);
+      try {
+        await openSavedChat(page, chatConfig);
+      } catch (err) {
+        console.log(`No pude abrir el chat guardado (${err.message}).`);
+        console.log("Pasando a seleccion manual...");
+        chatConfig = null;
+      }
     }
-    await openBotChat(page, BOT_USERNAME);
-    if (!HEADLESS) await page.bringToFront();
+
+    if (!chatConfig) {
+      chatConfig = await onboardChat(page);
+    }
+
+    currentChatName = chatConfig.name;
+    if (!headless) {
+      try {
+        await page.bringToFront();
+      } catch (_) {}
+    }
 
     await installAutoplayObserver(page);
     page.on("framenavigated", () => installAutoplayObserver(page).catch(() => {}));
     await seedSeenMessages(page);
 
     lastBotResponse = "Sistema listo. Te escucho.";
-    lastVoiceEvent = HEADLESS
-      ? "Modo headless activo. Audio por reproductor local."
-      : "Modo visible activo. Audio desde Telegram Web.";
-    renderCliShell(currentInputPreview);
+    lastAudioEvent = headless
+      ? "Modo headless. Audio por reproductor local."
+      : "Modo visible. Audio desde Telegram Web.";
+    renderCliShell();
 
-    const submitMessage = async (text, { source = "cli", spinner: localSpinner } = {}) => {
-      if (!text || waitingBotReply) return;
-      sessionArmed = true;
-      waitingBotReply = true;
-      if (source === "cli") rl.pause();
-      lastBotResponse = "Enviando mensaje...";
-      renderCliShell(currentInputPreview);
-      localSpinner.start("Esperando respuesta del bot...");
-      try {
-        await sendMessage(page, text);
-      } catch (err) {
-        waitingBotReply = false;
-        lastBotResponse = "Error al enviar mensaje.";
-        localSpinner.stop();
-        if (source === "cli") {
+    return await new Promise((resolve) => {
+      let pollHandle = null;
+      let resolved = false;
+
+      const onResize = () => {
+        if (!resolved) renderCliShell(currentInputPreview);
+      };
+      process.stdout.on("resize", onResize);
+
+      const cleanup = async () => {
+        if (pollHandle) clearInterval(pollHandle);
+        process.stdout.removeListener("resize", onResize);
+        try {
+          await browser.close();
+        } catch (_) {}
+      };
+
+      const spinner = createSpinner();
+
+      const submitMessage = async (text) => {
+        if (!text || waitingBotReply) return;
+        sessionArmed = true;
+        waitingBotReply = true;
+        rl.pause();
+        lastBotResponse = "Enviando mensaje...";
+        renderCliShell(currentInputPreview);
+        spinner.start("Esperando respuesta del bot...");
+        try {
+          await sendMessage(page, text);
+        } catch (err) {
+          waitingBotReply = false;
+          lastBotResponse = `Error al enviar: ${err.message}`;
+          spinner.stop();
           rl.resume();
           rl.prompt();
         }
-        throw err;
-      }
-    };
+      };
 
-    const rl = startCli(async (text) => {
-      await submitMessage(text, { source: "cli", spinner });
-    });
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+        prompt: "mensaje > ",
+      });
+      rl.prompt();
 
-    setInterval(async () => {
-      try {
-        await installAutoplayObserver(page);
-        const incoming = await readNewMessages(page);
-        let printedAny = false;
-        for (const msg of incoming) {
-          if (seenIds.has(msg.id)) continue;
-          seenIds.add(msg.id);
-          if (!sessionArmed) continue;
+      rl.on("line", async (line) => {
+        const text = line.trim();
+        if (!text) return rl.prompt();
 
-          if (waitingBotReply) {
-            waitingBotReply = false;
-            spinner.stop();
-            rl.resume();
-          }
-
-          if (msg.text) {
-            lastBotResponse = msg.text;
-          } else if (msg.hasVoice) {
-            lastBotResponse = "[mensaje de voz]";
-            lastVoiceEvent = "Mensaje de voz recibido y procesado.";
-          }
-          currentInputPreview = "";
-          renderCliShell(currentInputPreview);
-          printedAny = true;
+        if (text === "/salir") {
+          rl.close();
+          resolved = true;
+          await cleanup();
+          console.log("Hasta luego.");
+          return resolve("exit");
         }
-        if (printedAny) rl.prompt();
-      } catch (err) {
-        // silencioso para no spamear
-      }
-    }, POLL_INTERVAL_MS);
 
+        if (text === "/logout") {
+          rl.close();
+          resolved = true;
+          console.log("\nCerrando sesion y limpiando datos...");
+          await cleanup();
+          await clearAllSession();
+          console.log("Listo. Vamos a iniciar sesion de nuevo y elegir chat.\n");
+          return resolve("logout");
+        }
+
+        currentInputPreview = text;
+        renderCliShell(currentInputPreview);
+        await submitMessage(text);
+        if (!waitingBotReply) rl.prompt();
+      });
+
+      rl.on("close", async () => {
+        if (resolved) return;
+        resolved = true;
+        await cleanup();
+        resolve("exit");
+      });
+
+      pollHandle = setInterval(async () => {
+        if (resolved) return;
+        try {
+          await installAutoplayObserver(page);
+          const incoming = await readNewMessages(page);
+          let printedAny = false;
+          for (const msg of incoming) {
+            if (seenIds.has(msg.id)) continue;
+            seenIds.add(msg.id);
+            if (!sessionArmed) continue;
+
+            if (waitingBotReply) {
+              waitingBotReply = false;
+              spinner.stop();
+              rl.resume();
+            }
+
+            if (msg.text) {
+              lastBotResponse = msg.text;
+            } else if (msg.hasVoice) {
+              lastBotResponse = "[mensaje de voz]";
+              lastAudioEvent = "Mensaje de voz recibido.";
+            }
+            currentInputPreview = "";
+            renderCliShell(currentInputPreview);
+            printedAny = true;
+          }
+          if (printedAny) rl.prompt();
+        } catch (_) {
+          // silencioso
+        }
+      }, POLL_INTERVAL_MS);
+    });
   } catch (err) {
-    spinner.stop();
-    console.error("Fallo:", err.message);
-    await browser.close();
-    process.exit(1);
+    try {
+      await browser.close();
+    } catch (_) {}
+    throw err;
+  }
+}
+
+async function main() {
+  while (true) {
+    let result;
+    try {
+      result = await runSession();
+    } catch (err) {
+      console.error("Fallo:", err.message);
+      process.exit(1);
+    }
+    if (result === "exit") {
+      process.exit(0);
+    }
+    if (result !== "logout") {
+      process.exit(0);
+    }
+    // logout -> volver a iniciar el flujo
   }
 }
 

@@ -1,18 +1,25 @@
 # Telegram CLI Bot (Puppeteer)
 
-Proyecto base para hablar con un bot de Telegram desde terminal, usando Telegram Web automatizado con Puppeteer.
+CLI para hablar con cualquier chat o bot de Telegram desde la terminal, automatizando Telegram Web con Puppeteer.
 
-## Que hace este MVP
+## Que hace
 
-- Abre Telegram Web en Chromium.
-- Te deja escribir mensajes en la terminal y los envia al bot.
-- Muestra en terminal las respuestas de texto del bot.
-- Detecta mensajes de voz entrantes e intenta reproducirlos automaticamente en el navegador.
+- En el primer arranque abre Chromium **visible** para que escanees el QR de Telegram Web.
+- Lista tus chats en la terminal y te deja elegir uno por numero.
+- Guarda esa eleccion para que en arranques siguientes el chat se abra automaticamente.
+- Te deja escribir mensajes en la terminal y los envia al chat seleccionado.
+- Muestra en terminal las respuestas de texto.
+- Detecta mensajes de voz entrantes y los reproduce automaticamente (en el navegador o, si estas en headless, vuelca el audio a `ffplay`/`mpv`/`paplay`).
+- Comandos especiales:
+  - `/logout` — cierra sesion, borra cookies + chat guardado y reinicia el flujo (login + seleccion de chat).
+  - `/salir` — cierra el CLI.
+- Interfaz responsiva al tamano del terminal (banner compacto y panel de bot opcional segun ancho/alto).
 
 ## Requisitos
 
 - Node.js 18+
 - Linux con audio habilitado
+- (Opcional, para audio en modo headless) `ffplay`, `mpv` o `paplay` instalado.
 
 ## Instalacion
 
@@ -22,37 +29,40 @@ npm install
 
 ## Uso
 
-Por defecto abre directamente este chat:
-
-```bash
-https://web.telegram.org/a/#8489015629
-```
-
-Y usa como username por defecto: `IL_assistantbot`.
-
-Ejecucion minima:
-
 ```bash
 npm start
 ```
 
-Opcional (sobrescribir chat/url):
+Primer arranque:
 
-```bash
-TELEGRAM_CHAT_URL="https://web.telegram.org/a/#8489015629" TELEGRAM_BOT_USERNAME=IL_assistantbot npm start
+1. Se abrira Chromium con Telegram Web.
+2. Escanea el QR para iniciar sesion.
+3. Espera a que aparezca tu lista de chats.
+4. En la terminal veras los chats numerados. Escribe el numero del chat que quieras abrir.
+5. La eleccion se guarda en `.telegram-session/chat-config.json`.
+
+Arranques siguientes:
+
+1. Se restaura la sesion guardada y se abre directamente el chat elegido (en headless por defecto).
+2. Escribe en terminal: `mensaje > hola` y presiona Enter.
+
+Para cambiar de chat o de cuenta:
+
+```
+/logout
 ```
 
-## Flujo de primer arranque
+Esto borra `.telegram-session/` (cookies + chat guardado) y vuelve a empezar con el QR + seleccion de chat.
 
-1. Se abrira Telegram Web.
-2. Inicia sesion con QR si hace falta.
-3. El script buscara y abrira el chat del bot.
-4. Escribe en terminal: `Tu mensaje > hola`.
-5. Para salir: `/salir`.
+## Variables de entorno opcionales
 
-## Notas importantes
+- `HEADLESS=0` — fuerza Chromium visible siempre.
+- `HEADLESS=1` — fuerza headless siempre (incluso en el primer arranque, no recomendado).
+- `ENABLE_SYSTEM_AUDIO_FALLBACK=1` — fuerza el reproductor local aunque estes en modo visible.
+- `ENABLE_SYSTEM_AUDIO_FALLBACK=0` — desactiva el reproductor local incluso en headless.
 
-- La sesion se guarda en `.telegram-session`, para no loguearte cada vez.
-- La reproduccion de voz depende de cambios UI de Telegram Web. Si Telegram cambia clases internas, puede requerir ajuste.
-- Este MVP reproduce audios en el navegador controlado por Puppeteer (no descarga ni convierte archivos de voz localmente).
-- Para mejorar autoplay, Chromium se lanza con `--autoplay-policy=no-user-gesture-required`.
+## Notas
+
+- La sesion se guarda en `.telegram-session/`, junto con el chat seleccionado en `.telegram-session/chat-config.json`.
+- La reproduccion automatica de voz depende de selectores internos de Telegram Web. Si Telegram cambia clases, puede requerir ajuste.
+- Chromium se lanza con `--autoplay-policy=no-user-gesture-required` para mejorar el autoplay de audios.
