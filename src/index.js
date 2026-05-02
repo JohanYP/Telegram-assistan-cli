@@ -533,14 +533,18 @@ async function playVoice(page, key) {
   }
 
   // En headless el navegador no produce audio audible, asi que ademas leemos
-  // el blob capturado por el fetch hook y lo pasamos a ffplay/mpv.
+  // el blob capturado por los hooks (fetch/XHR/MSE/MediaRecorder) y lo
+  // pasamos a ffplay/mpv.
   if (SYSTEM_PLAYER) {
-    const audio = await pollForNewAudio(page, tsBefore);
+    const audio = await pollForNewAudio(page, tsBefore, 60000);
     if (audio && audio.buf && audio.buf.length >= 200) {
       playAudioBuffer(audio.buf);
       lastAudioEvent = `Reproduciendo (${SYSTEM_PLAYER.bin}, ${(audio.buf.length / 1024).toFixed(0)} KB).`;
     } else {
-      lastAudioEvent = "Click hecho pero no llego ningun blob de audio (timeout).";
+      const debug = await page
+        .evaluate(() => (window.__tgAudioDebug || []).slice(-5).join(" | "))
+        .catch(() => "");
+      lastAudioEvent = `Audio: timeout. Hooks: [${debug}]`;
     }
     renderCliShell(currentInputPreview);
   }
@@ -562,67 +566,213 @@ async function processVoicePending(page) {
   }
 }
 
-// Hook de window.fetch: Telegram Web "/a/" sirve los audios via Service
-// Worker desde IndexedDB con URLs internas tipo
-// /a/progressive/documentXXX. Esas URLs no son resolvibles desde Node ni
-// con un fetch arbitrario (el SW solo responde al <audio> element).
-// Hookeando window.fetch ANTES de que la pagina cargue capturamos el blob
-// real cuando el SW lo entrega.
-const FETCH_HOOK_FN = function () {
-  if (window.__tgFetchHooked) return;
-  window.__tgFetchHooked = true;
+// Telegram Web "/a/" sirve audios desde un Service Worker que los lee de
+// IndexedDB. Las URLs son internas (ej. /a/progressive/documentXXX) y solo
+// el HTMLMediaElement las puede resolver. Para capturar el blob real
+// hookeamos fetch + XHR + MediaSource desde page.evaluateOnNewDocument
+// ANTES de que cargue Telegram.
+const AUDIO_HOOK_FN = function () {
+  if (window.__tgAudioHooked) return;
+  window.__tgAudioHooked = true;
   window.__tgAudioBuffers = window.__tgAudioBuffers || {};
+  window.__tgAudioDebug = window.__tgAudioDebug || [];
 
-  const origFetch = window.fetch.bind(window);
-  window.fetch = async function (input, init) {
-    let url = "";
-    try {
-      url = typeof input === "string" ? input : (input && input.url) || "";
-    } catch (_) {}
+  function log(msg) {
+    window.__tgAudioDebug.push(`${Date.now()} ${msg}`);
+    if (window.__tgAudioDebug.length > 100) window.__tgAudioDebug.shift();
+  }
 
-    const resp = await origFetch(input, init);
+  function isAudioLike(url, ct) {
+    return (
+      (ct && (ct.includes("audio") || ct.includes("opus"))) ||
+      /\.(ogg|oga|opus|mp3|m4a|wav)/i.test(url || "") ||
+      /progressive\/document/i.test(url || "")
+    );
+  }
 
-    try {
-      if (resp && resp.ok && url) {
-        const ct = (resp.headers.get("content-type") || "").toLowerCase();
-        const isAudio =
-          ct.includes("audio") ||
-          ct.includes("opus") ||
-          /\.(ogg|oga|opus|mp3|m4a|wav)/i.test(url) ||
-          /progressive\/document/i.test(url);
+  function publishBlob(url, blob) {
+    if (!blob || blob.size < 200) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      window.__tgAudioBuffers[url || `auto-${Date.now()}`] = {
+        dataUrl: reader.result,
+        ts: Date.now(),
+        size: blob.size,
+        type: blob.type || "",
+      };
+      log(`buf ${blob.size}B from ${url ? url.slice(0, 60) : "?"}`);
+    };
+    reader.readAsDataURL(blob);
+  }
 
-        if (isAudio) {
-          const cloned = resp.clone();
-          cloned
-            .blob()
-            .then(async (blob) => {
-              if (!blob || blob.size < 200) return;
-              const dataUrl = await new Promise((resolve) => {
-                const reader = new FileReader();
-                reader.onload = () => resolve(reader.result);
-                reader.onerror = () => resolve(null);
-                reader.readAsDataURL(blob);
-              });
-              if (dataUrl) {
-                window.__tgAudioBuffers[url] = {
-                  dataUrl,
-                  ts: Date.now(),
-                  size: blob.size,
-                };
-              }
-            })
-            .catch(() => {});
+  // 1. window.fetch
+  try {
+    const origFetch = window.fetch.bind(window);
+    window.fetch = async function (input, init) {
+      const url = typeof input === "string" ? input : (input && input.url) || "";
+      const resp = await origFetch(input, init);
+      try {
+        if (resp && resp.ok) {
+          const ct = (resp.headers.get("content-type") || "").toLowerCase();
+          if (isAudioLike(url, ct)) {
+            resp.clone().blob().then((blob) => publishBlob(url, blob)).catch(() => {});
+          }
+        }
+      } catch (_) {}
+      return resp;
+    };
+    log("fetch hooked");
+  } catch (e) {
+    log(`fetch hook err: ${e && e.message}`);
+  }
+
+  // 2. XMLHttpRequest
+  try {
+    const XHR = window.XMLHttpRequest;
+    const origOpen = XHR.prototype.open;
+    XHR.prototype.open = function (method, url) {
+      this.__tgUrl = url || "";
+      return origOpen.apply(this, arguments);
+    };
+    const origSend = XHR.prototype.send;
+    XHR.prototype.send = function () {
+      this.addEventListener("load", function () {
+        try {
+          const url = this.__tgUrl || "";
+          const ct = (
+            (this.getResponseHeader && this.getResponseHeader("content-type")) ||
+            ""
+          ).toLowerCase();
+          if (!isAudioLike(url, ct)) return;
+          let blob = null;
+          if (this.response instanceof Blob) blob = this.response;
+          else if (this.response instanceof ArrayBuffer)
+            blob = new Blob([this.response], { type: ct || "audio/ogg" });
+          if (blob) publishBlob(url, blob);
+        } catch (_) {}
+      });
+      return origSend.apply(this, arguments);
+    };
+    log("xhr hooked");
+  } catch (e) {
+    log(`xhr hook err: ${e && e.message}`);
+  }
+
+  // 3. MediaSource.appendBuffer (audios servidos via MSE / streaming)
+  try {
+    if (window.MediaSource && window.SourceBuffer) {
+      const origAdd = MediaSource.prototype.addSourceBuffer;
+      MediaSource.prototype.addSourceBuffer = function (mime) {
+        const sb = origAdd.apply(this, arguments);
+        const lc = (mime || "").toLowerCase();
+        if (lc.includes("audio")) {
+          sb.__tgChunks = [];
+          sb.__tgMime = mime;
+          let endTimer = null;
+          const flush = () => {
+            try {
+              if (!sb.__tgChunks || !sb.__tgChunks.length) return;
+              const total = sb.__tgChunks.reduce((s, c) => s + c.length, 0);
+              const merged = new Uint8Array(total);
+              let off = 0;
+              for (const c of sb.__tgChunks) { merged.set(c, off); off += c.length; }
+              sb.__tgChunks = [];
+              const blob = new Blob([merged], { type: sb.__tgMime || "audio/ogg" });
+              publishBlob(`mse-${Date.now()}`, blob);
+            } catch (_) {}
+          };
+          const origAppend = sb.appendBuffer;
+          sb.appendBuffer = function (data) {
+            try {
+              let bytes = null;
+              if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+              else if (ArrayBuffer.isView(data))
+                bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+              if (bytes) sb.__tgChunks.push(bytes.slice());
+            } catch (_) {}
+            if (endTimer) clearTimeout(endTimer);
+            endTimer = setTimeout(flush, 2500);
+            return origAppend.apply(this, arguments);
+          };
+        }
+        return sb;
+      };
+      log("mediasource hooked");
+    }
+  } catch (e) {
+    log(`mse hook err: ${e && e.message}`);
+  }
+
+  // 4. Grabar el output del HTMLMediaElement con MediaRecorder. Cubre el caso
+  // donde el <audio src="..."> pide el archivo directamente al SW y nada
+  // pasa por fetch/XHR/MSE.
+  function attachRecorder(audio) {
+    if (!audio || audio.__tgRecAttached) return;
+    audio.__tgRecAttached = true;
+    audio.addEventListener("play", function () {
+      if (audio.__tgRecording) return;
+      audio.__tgRecording = true;
+      try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        if (!window.__tgAudioCtx) window.__tgAudioCtx = new Ctx();
+        const ctx = window.__tgAudioCtx;
+        const source = ctx.createMediaElementSource(audio);
+        const dest = ctx.createMediaStreamDestination();
+        source.connect(dest);
+        source.connect(ctx.destination);
+
+        let mime = "audio/webm;codecs=opus";
+        if (typeof MediaRecorder !== "undefined" && !MediaRecorder.isTypeSupported(mime)) {
+          mime = "audio/webm";
+        }
+        const recorder = new MediaRecorder(dest.stream, { mimeType: mime });
+        const chunks = [];
+        recorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) chunks.push(e.data);
+        };
+        recorder.onstop = () => {
+          if (!chunks.length) return;
+          const blob = new Blob(chunks, { type: mime });
+          publishBlob(audio.src || `rec-${Date.now()}`, blob);
+        };
+        const stopIfEnded = () => {
+          if (recorder.state === "recording") recorder.stop();
+        };
+        audio.addEventListener("ended", stopIfEnded);
+        audio.addEventListener("pause", () => {
+          if (audio.duration && audio.currentTime >= audio.duration - 0.3) stopIfEnded();
+        });
+        recorder.start(1000);
+        log(`rec started for ${audio.src ? audio.src.slice(0, 60) : "?"}`);
+      } catch (e) {
+        log(`rec err: ${e && e.message}`);
+      }
+    });
+  }
+
+  try {
+    document.querySelectorAll("audio").forEach(attachRecorder);
+    const obs = new MutationObserver((muts) => {
+      for (const m of muts) {
+        if (!m.addedNodes) continue;
+        for (const n of m.addedNodes) {
+          if (n.nodeType !== 1) continue;
+          if (n.tagName === "AUDIO") attachRecorder(n);
+          if (n.querySelectorAll) n.querySelectorAll("audio").forEach(attachRecorder);
         }
       }
-    } catch (_) {}
-
-    return resp;
-  };
+    });
+    obs.observe(document.documentElement || document.body, { childList: true, subtree: true });
+    log("recorder observer installed");
+  } catch (e) {
+    log(`rec observer err: ${e && e.message}`);
+  }
 };
 
 async function installFetchHook(page) {
-  await page.evaluateOnNewDocument(FETCH_HOOK_FN).catch(() => {});
-  await page.evaluate(FETCH_HOOK_FN).catch(() => {});
+  await page.evaluateOnNewDocument(AUDIO_HOOK_FN).catch(() => {});
+  await page.evaluate(AUDIO_HOOK_FN).catch(() => {});
 }
 
 let currentAudioChild = null;
