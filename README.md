@@ -1,75 +1,84 @@
-# Telegram CLI Bot (Puppeteer)
+# tgvoice
 
-CLI para hablar con cualquier chat o bot de Telegram desde la terminal, automatizando Telegram Web con Puppeteer.
+Cliente CLI para Linux que te deja hablar con tu propio bot de Telegram desde la terminal:
+- Escribes texto en el prompt y se envía al bot.
+- Cuando el bot responde con texto, aparece en el chat. Si responde con audio, se reproduce solo en tus altavoces.
+- Si dices la **wake word** (por defecto `hey jarvis`), graba lo que dices y se lo manda al bot como voice message.
 
-## Que hace
+> **Nota técnica:** los bots de Telegram no pueden hablarse a sí mismos, así que este cliente se conecta como **tu cuenta de usuario** (vía MTProto), no como bot.
 
-- En el primer arranque abre Chromium **visible** para que escanees el QR de Telegram Web.
-- Lista tus chats en la terminal y te deja elegir uno por numero.
-- Guarda esa eleccion para que en arranques siguientes el chat se abra automaticamente.
-- Te deja escribir mensajes en la terminal y los envia al chat seleccionado.
-- Muestra en terminal las respuestas de texto.
-- Detecta mensajes de voz entrantes y los reproduce automaticamente (en el navegador o, si estas en headless, vuelca el audio a `ffplay`/`mpv`/`paplay`).
-- Comandos especiales:
-  - `/visible` — reinicia el browser en modo visible (sin borrar sesion ni chat). Util para depurar.
-  - `/logout` — cierra sesion, borra cookies + chat guardado y reinicia el flujo (login + seleccion de chat).
-  - `/salir` — cierra el CLI.
-- Interfaz responsiva al tamano del terminal (banner compacto y panel de bot opcional segun ancho/alto).
-
-## Requisitos
-
-- Node.js 18+
-- Linux con audio habilitado
-- (Opcional, para audio en modo headless) `ffplay`, `mpv` o `paplay` instalado.
-
-## Instalacion
+## 1. Pre-requisitos
 
 ```bash
-npm install
+sudo apt update
+sudo apt install -y ffmpeg portaudio19-dev python3-venv
 ```
 
-## Uso
+Sacar credenciales de Telegram (una vez):
+1. Entra en https://my.telegram.org con tu número.
+2. Ve a **API development tools**.
+3. Crea una app cualquiera (el nombre da igual). Apunta `api_id` y `api_hash`.
+
+## 2. Instalación
 
 ```bash
-npm start
+cd tgvoice
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
 ```
 
-Para depurar con el browser visible (sin headless):
+## 3. Configuración
 
 ```bash
-npm run debug
+cp .env.example .env
+$EDITOR .env
 ```
 
-Primer arranque:
+Completa:
+- `API_ID` y `API_HASH` (paso 1).
+- `BOT_USERNAME` con el `@username` de tu bot.
+- (opcional) `WAKE_WORD`: una de `hey_jarvis`, `alexa`, `hey_mycroft`, `hey_rhasspy`.
 
-1. Se abrira Chromium con Telegram Web.
-2. Escanea el QR para iniciar sesion.
-3. Espera a que aparezca tu lista de chats.
-4. En la terminal veras los chats numerados. Escribe el numero del chat que quieras abrir.
-5. La eleccion se guarda en `.telegram-session/chat-config.json`.
+## 4. Uso
 
-Arranques siguientes:
-
-1. Se restaura la sesion guardada y se abre directamente el chat elegido (en headless por defecto).
-2. Escribe en terminal: `mensaje > hola` y presiona Enter.
-
-Para cambiar de chat o de cuenta:
-
-```
-/logout
+```bash
+tgvoice
+# o equivalente:
+python -m tgvoice
 ```
 
-Esto borra `.telegram-session/` (cookies + chat guardado) y vuelve a empezar con el QR + seleccion de chat.
+La primera vez te pedirá tu número de teléfono y un código que te llega por Telegram. Se guarda una sesión en `tgvoice.session` para que los siguientes arranques sean instantáneos.
 
-## Variables de entorno opcionales
+A partir de ahí:
+- Escribe en el prompt `›` para enviar texto.
+- Di la wake word para grabar y enviar audio.
+- Las respuestas del bot aparecen automáticamente; las de audio se reproducen solas.
+- `Ctrl+C` o `Ctrl+D` para salir.
 
-- `HEADLESS=0` — fuerza Chromium visible siempre.
-- `HEADLESS=1` — fuerza headless siempre (incluso en el primer arranque, no recomendado).
-- `ENABLE_SYSTEM_AUDIO_FALLBACK=1` — fuerza el reproductor local aunque estes en modo visible.
-- `ENABLE_SYSTEM_AUDIO_FALLBACK=0` — desactiva el reproductor local incluso en headless.
+## 5. Solución de problemas
 
-## Notas
+- **No se oye nada / `ffplay: command not found`**: instala `ffmpeg`.
+- **`PortAudioError`**: instala `portaudio19-dev` y reinstala `pip install --force-reinstall sounddevice`.
+- **No detecta el micrófono correcto**: lista dispositivos con `python -c "import sounddevice; print(sounddevice.query_devices())"` y pon el índice en `INPUT_DEVICE` del `.env`.
+- **La wake word casi no se activa**: baja `WAKE_THRESHOLD` (por ejemplo a `0.3`).
+- **Se activa con cualquier ruido**: súbelo (`0.6`–`0.7`).
+- **Logs**: están en `.cache/tgvoice.log`.
 
-- La sesion se guarda en `.telegram-session/`, junto con el chat seleccionado en `.telegram-session/chat-config.json`.
-- La reproduccion automatica de voz depende de selectores internos de Telegram Web. Si Telegram cambia clases, puede requerir ajuste.
-- Chromium se lanza con `--autoplay-policy=no-user-gesture-required` para mejorar el autoplay de audios.
+## 6. Estructura
+
+```
+tgvoice/
+├── pyproject.toml
+├── .env.example
+├── README.md
+└── src/tgvoice/
+    ├── __main__.py       # entry point + orquestación
+    ├── config.py         # carga .env
+    ├── telegram.py       # Telethon (login, envío, listener)
+    ├── wake_word.py      # openWakeWord
+    ├── recorder.py       # captura mic con VAD
+    ├── encoder.py        # WAV -> OGG/Opus (ffmpeg)
+    ├── player.py         # cola de reproducción (ffplay)
+    └── tui.py            # rich + prompt_toolkit
+```

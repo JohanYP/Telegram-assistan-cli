@@ -1,2 +1,11 @@
-node_modules/
-.telegram-session/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+*.session
+*.session-journal
+.cache/
+build/
+dist/
