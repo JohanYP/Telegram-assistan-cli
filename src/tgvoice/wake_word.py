@@ -108,8 +108,7 @@ class VoskBackend(WakeWord):
         model_dirname, url = self.MODELS[settings.vosk_lang]
         model_path = settings.cache_dir / model_dirname
         if not model_path.exists():
-            log.info("Descargando modelo Vosk %s...", model_dirname)
-            print(f"   Descargando modelo Vosk ({model_dirname}, ~40 MB)...")
+            log.info("Descargando modelo Vosk %s (~40 MB)...", model_dirname)
             self._download_and_extract(url, settings.cache_dir)
         self._model = vosk.Model(str(model_path))
         self._wake_phrase = settings.wake_word.replace("_", " ").lower().strip()

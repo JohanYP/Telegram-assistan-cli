@@ -8,12 +8,9 @@ import sys
 import threading
 from pathlib import Path
 
-from . import config, encoder, sounds
-from .player import Player
-from .recorder import Recorder
-from .telegram import IncomingText, IncomingVoice, Telegram
-from .tui import TUI
-from .wake_word import make_wake_word
+from . import config
+from .telegram import Telegram
+from .tui import TgvoiceApp
 
 log = logging.getLogger(__name__)
 
@@ -32,101 +29,28 @@ async def _amain() -> None:
     settings = config.load()
     _setup_logging(settings.cache_dir)
 
-    tui = TUI()
-    tui.print_info(f"conectando a Telegram… (sesión: {settings.session_path.name})")
-
+    # Login interactivo ANTES de la TUI: Textual captura stdin y rompería
+    # los input() que Telethon usa para pedir teléfono / código / 2FA.
+    print(f"conectando a Telegram… (sesión: {settings.session_path.name})")
+    print("si es la primera vez te pedirá teléfono y un código por Telegram.\n")
     tg = Telegram(settings)
     await tg.start()
-    tui.print_info(f"listo. hablando con @{settings.bot_username}")
+    print(f"✓ conectado. hablando con @{settings.bot_username}\n")
 
-    player = Player()
-    await player.start()
-
-    recorder = Recorder(settings)
-
-    async def handle_incoming(msg: IncomingText | IncomingVoice) -> None:
-        if isinstance(msg, IncomingText):
-            tui.print_bot(msg.text)
-        else:
-            tui.print_bot_voice()
-            await player.enqueue(msg.path)
-
-    tg.on_incoming(handle_incoming)
-
-    async def on_user_text(text: str) -> None:
-        tui.print_me(text)
-        try:
-            await tg.send_text(text)
-        except Exception as e:
-            tui.print_error(f"no se pudo enviar: {e}")
-
-    tui.print_info(
-        f"cargando wake word '{settings.wake_word}' "
-        f"[backend={settings.wake_backend}]… (puede tardar la primera vez)"
-    )
-    wake = make_wake_word(settings)
-    tui.print_info(f"di '{settings.wake_word.replace('_', ' ')}' para hablar por voz, o escribe abajo.")
-
-    async def voice_loop() -> None:
-        while True:
-            try:
-                tui.set_status("💤 esperando wake word")
-                await wake.listen()
-                await asyncio.to_thread(sounds.play_ding)
-                tui.set_status("🎙 grabando…")
-                wav = await recorder.record()
-                await asyncio.to_thread(sounds.play_close)
-                if wav is None:
-                    tui.print_info("no detecté voz; vuelvo a escuchar")
-                    continue
-                tui.set_status("🎚 codificando…")
-                try:
-                    ogg = await encoder.wav_to_opus_ogg(wav)
-                except RuntimeError as e:
-                    tui.print_error(f"codificación: {e}")
-                    wav.unlink(missing_ok=True)
-                    continue
-                tui.set_status("⬆ enviando…")
-                try:
-                    await tg.send_voice(ogg)
-                    tui.print_me("🔊 [audio enviado]")
-                except Exception as e:
-                    tui.print_error(f"envío: {e}")
-                finally:
-                    wav.unlink(missing_ok=True)
-                    ogg.unlink(missing_ok=True)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.exception("voice loop")
-                tui.print_error(f"voz: {e}")
-                await asyncio.sleep(1)
-
-    voice_task = asyncio.create_task(voice_loop(), name="voice-loop")
-
+    app = TgvoiceApp(settings, tg)
     try:
-        await tui.input_loop(on_user_text)
+        await app.run_async()
     finally:
-        voice_task.cancel()
-        try:
-            await voice_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        await player.stop()
-        await tg.disconnect()
-        tui.print_info("hasta luego.")
+        await app.cleanup()
 
 
 def _install_signal_handlers() -> None:
-    # Cuando el terminal se cierra (SIGHUP) o nos mandan SIGTERM, asyncio
-    # intenta limpiar pero el thread de PortAudio se queda bloqueado en
-    # stream.read() y el executor espera por el indefinidamente. Resultado:
-    # proceso zombie que tira la responsividad del sistema. Programamos un
-    # os._exit() forzoso a los 2s y disparamos KeyboardInterrupt para que
-    # asyncio empiece a salir.
+    # SIGHUP (cierre de terminal) o SIGTERM: forzamos salida en 2s por si
+    # algun thread de PortAudio queda bloqueado en stream.read().
     def _handler(signum, _frame):
         threading.Timer(2.0, lambda: os._exit(0)).start()
         raise KeyboardInterrupt
+
     for sig in (signal.SIGHUP, signal.SIGTERM):
         signal.signal(sig, _handler)
 
