@@ -478,17 +478,24 @@ async function installAutoplayObserver(page) {
       );
     }
 
-    function forcePlayAudio(messageNode) {
+    function attachStartedListener(messageNode, audio) {
+      if (!audio || audio.__tgListenerAttached) return;
+      audio.__tgListenerAttached = true;
+      const markStarted = () => { messageNode.__tgStarted = true; };
+      audio.addEventListener("playing", markStarted);
+      audio.addEventListener("timeupdate", () => {
+        if (audio.currentTime > 0.15) markStarted();
+      });
+    }
+
+    function audioAlreadyStarted(messageNode) {
+      if (messageNode.__tgStarted) return true;
       const audio = messageNode.querySelector("audio");
-      if (!audio) return false;
-      try {
-        audio.muted = false;
-        audio.volume = 1;
-        audio.play().catch(() => {});
-        return !audio.paused;
-      } catch (_) {
-        return false;
+      if (audio && (audio.currentTime > 0 || (!audio.paused && audio.readyState >= 2))) {
+        messageNode.__tgStarted = true;
+        return true;
       }
+      return false;
     }
 
     function tryPlay(messageNode, attempt) {
@@ -507,14 +514,27 @@ async function installAutoplayObserver(page) {
         messageNode.scrollIntoView?.({ block: "center", behavior: "auto" });
       }
 
+      // Si el audio ya inicio en algun reintento previo, no tocar el boton (es un toggle play/pause).
+      if (audioAlreadyStarted(messageNode)) return true;
+
+      const audio = messageNode.querySelector("audio");
+      attachStartedListener(messageNode, audio);
+
       const target = findClickable(messageNode);
       if (target) fireClick(target);
-      const playing = forcePlayAudio(messageNode);
 
-      // Reintentos: el primer click suele iniciar la descarga; el siguiente reproduce.
-      // Hasta 4 intentos espaciados ~700ms para cubrir descarga lenta + segundo click de play.
-      if (!playing && attempt < 4) {
-        setTimeout(() => tryPlay(messageNode, attempt + 1), 700);
+      if (audio) {
+        try {
+          audio.muted = false;
+          audio.volume = 1;
+          audio.play().catch(() => {});
+        } catch (_) {}
+      }
+
+      // Reintentos: el primer click puede iniciar la descarga; el siguiente reproduce.
+      // El listener "playing"/"timeupdate" frenara los reintentos en cuanto el audio arranque.
+      if (attempt < 3) {
+        setTimeout(() => tryPlay(messageNode, attempt + 1), 1000);
       }
       return true;
     }
