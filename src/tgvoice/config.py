@@ -35,8 +35,11 @@ def _require(name: str) -> str:
 
 
 def load() -> Settings:
-    load_dotenv()
     project_root = Path(__file__).resolve().parents[2]
+    # Cargamos el .env desde la raíz del proyecto explícitamente para que
+    # `tgvoice` funcione desde cualquier cwd (por ejemplo, vía symlink en
+    # ~/.local/bin) sin depender del directorio donde se invoque.
+    load_dotenv(project_root / ".env")
     cache_dir = project_root / ".cache"
     cache_dir.mkdir(exist_ok=True)
 

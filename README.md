@@ -57,11 +57,20 @@ Completa:
 
 ## 4. Uso
 
+Con el venv activado:
 ```bash
 tgvoice
 # o equivalente:
 python -m tgvoice
 ```
+
+Para ejecutarlo desde cualquier directorio sin activar el venv, haz un symlink al binario que generó pip:
+```bash
+mkdir -p ~/.local/bin
+ln -sf "$(pwd)/.venv/bin/tgvoice" ~/.local/bin/tgvoice
+# Asegúrate de tener ~/.local/bin en PATH (en Arch suele estarlo).
+```
+A partir de ahí, `tgvoice` funciona desde donde sea — el shebang del script apunta al Python del venv, así que arrastra todas las dependencias correctas.
 
 La primera vez te pedirá tu número de teléfono y un código que te llega por Telegram. Se guarda una sesión en `tgvoice.session` para que los siguientes arranques sean instantáneos.
 
