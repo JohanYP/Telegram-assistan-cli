@@ -827,6 +827,61 @@ const AUDIO_HOOK_FN = function () {
   } catch (e) {
     log(`rec observer err: ${e && e.message}`);
   }
+
+  // 5. URL.createObjectURL: Telegram crea un blob: URL del audio leido de
+  // IDB y se la asigna al <audio src=...>. Aqui capturamos el blob real.
+  try {
+    const origCreate = URL.createObjectURL.bind(URL);
+    URL.createObjectURL = function (obj) {
+      const url = origCreate(obj);
+      try {
+        if (obj instanceof Blob) {
+          const t = (obj.type || "").toLowerCase();
+          // Heuristica: blob de audio explicito O blob "anonimo" >5KB
+          // (los voice messages tipicos pesan asi).
+          if (t.includes("audio") || t.includes("opus") || (!t && obj.size > 5000)) {
+            publishBlob(url, obj);
+          }
+        }
+      } catch (_) {}
+      return url;
+    };
+    log("createObjectURL hooked");
+  } catch (e) {
+    log(`url hook err: ${e && e.message}`);
+  }
+
+  // 6. IDBObjectStore.get: Telegram Web "/a/" guarda los voice messages en
+  // IndexedDB. Cuando los va a reproducir, los lee directamente de aqui.
+  try {
+    if (window.IDBObjectStore) {
+      const origGet = IDBObjectStore.prototype.get;
+      IDBObjectStore.prototype.get = function () {
+        const req = origGet.apply(this, arguments);
+        req.addEventListener("success", function () {
+          try {
+            const r = this.result;
+            if (r instanceof Blob) {
+              const t = (r.type || "").toLowerCase();
+              if (t.includes("audio") || t.includes("opus") || (!t && r.size > 5000)) {
+                publishBlob(`idb-${Date.now()}`, r);
+              }
+            } else if (r && typeof r === "object" && r.blob instanceof Blob) {
+              // Algunos schemas envuelven el blob en un objeto.
+              const t = (r.blob.type || "").toLowerCase();
+              if (t.includes("audio") || t.includes("opus") || (!t && r.blob.size > 5000)) {
+                publishBlob(`idb-blob-${Date.now()}`, r.blob);
+              }
+            }
+          } catch (_) {}
+        });
+        return req;
+      };
+      log("idb hooked");
+    }
+  } catch (e) {
+    log(`idb hook err: ${e && e.message}`);
+  }
 };
 
 async function installFetchHook(page) {
