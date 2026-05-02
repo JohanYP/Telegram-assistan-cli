@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import zipfile
+from pathlib import Path
+from urllib.request import urlretrieve
 
 import numpy as np
 import sounddevice as sd
@@ -10,18 +14,26 @@ from .config import Settings
 
 log = logging.getLogger(__name__)
 
-# openWakeWord espera frames de 80 ms a 16 kHz, int16 mono.
 SAMPLE_RATE = 16_000
-WAKE_FRAME_SAMPLES = 1280
-
-
-PREBUILT = ("alexa", "hey_jarvis", "hey_mycroft", "hey_rhasspy")
 
 
 class WakeWord:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        # Lazy import: openwakeword carga modelos al instanciar.
+
+    async def listen(self) -> None:
+        await asyncio.to_thread(self._listen_blocking)
+
+    def _listen_blocking(self) -> None:
+        raise NotImplementedError
+
+
+class OpenWakeWordBackend(WakeWord):
+    PREBUILT = ("alexa", "hey_jarvis", "hey_mycroft", "hey_rhasspy")
+    FRAME_SAMPLES = 1280  # 80 ms
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
         import openwakeword
         try:
             openwakeword.utils.download_models()
@@ -36,35 +48,108 @@ class WakeWord:
         except Exception as e:
             raise SystemExit(
                 f"No se pudo cargar la wake word '{settings.wake_word}': {e}\n"
-                f"Pre-entrenadas disponibles: {', '.join(PREBUILT)}.\n"
-                f"Para una palabra personalizada hay que entrenar un modelo aparte."
+                f"Pre-entrenadas disponibles: {', '.join(self.PREBUILT)}.\n"
+                f"Para una palabra personalizada usa WAKE_BACKEND=vosk."
             )
         loaded = list(getattr(self._model, "models", {}).keys())
         if not loaded or settings.wake_word not in loaded:
             raise SystemExit(
                 f"Wake word '{settings.wake_word}' no se cargó (loaded={loaded}).\n"
-                f"Pre-entrenadas disponibles: {', '.join(PREBUILT)}."
+                f"Pre-entrenadas disponibles: {', '.join(self.PREBUILT)}."
             )
-        log.info("Wake word lista: %s", settings.wake_word)
-
-    async def listen(self) -> None:
-        """Bloquea hasta que se detecte la wake word, entonces vuelve."""
-        await asyncio.to_thread(self._listen_blocking)
+        log.info("openWakeWord lista: %s", settings.wake_word)
 
     def _listen_blocking(self) -> None:
         threshold = self._settings.wake_threshold
         word = self._settings.wake_word
         with sd.RawInputStream(
             samplerate=SAMPLE_RATE,
-            blocksize=WAKE_FRAME_SAMPLES,
+            blocksize=self.FRAME_SAMPLES,
             dtype="int16",
             channels=1,
             device=self._settings.input_device,
         ) as stream:
             while True:
-                data, _overflowed = stream.read(WAKE_FRAME_SAMPLES)
+                data, _overflowed = stream.read(self.FRAME_SAMPLES)
                 arr = np.frombuffer(bytes(data), dtype=np.int16)
                 preds = self._model.predict(arr)
                 if preds.get(word, 0.0) >= threshold:
                     self._model.reset()
                     return
+
+
+class VoskBackend(WakeWord):
+    """Usa Vosk con grammar restringida a la frase de wake word.
+
+    Esto deja que cualquier frase (ej. 'hey il') funcione sin entrenar nada.
+    El reconocedor solo puede emitir la frase configurada o '[unk]'.
+    """
+
+    MODELS = {
+        "es": (
+            "vosk-model-small-es-0.42",
+            "https://alphacephei.com/vosk/models/vosk-model-small-es-0.42.zip",
+        ),
+        "en": (
+            "vosk-model-small-en-us-0.15",
+            "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
+        ),
+    }
+    FRAME_SAMPLES = 4000  # 250 ms a 16 kHz
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        import vosk
+        vosk.SetLogLevel(-1)
+        if settings.vosk_lang not in self.MODELS:
+            raise SystemExit(
+                f"VOSK_LANG '{settings.vosk_lang}' no soportado. Usa 'es' o 'en'."
+            )
+        model_dirname, url = self.MODELS[settings.vosk_lang]
+        model_path = settings.cache_dir / model_dirname
+        if not model_path.exists():
+            log.info("Descargando modelo Vosk %s...", model_dirname)
+            print(f"   Descargando modelo Vosk ({model_dirname}, ~40 MB)...")
+            self._download_and_extract(url, settings.cache_dir)
+        self._model = vosk.Model(str(model_path))
+        self._wake_phrase = settings.wake_word.replace("_", " ").lower().strip()
+        if not self._wake_phrase:
+            raise SystemExit("WAKE_WORD vacío.")
+        # Grammar: solo reconoce la frase o "[unk]" (palabra desconocida).
+        self._grammar = json.dumps([self._wake_phrase, "[unk]"])
+        log.info("Vosk lista. frase='%s' modelo=%s", self._wake_phrase, model_dirname)
+
+    @staticmethod
+    def _download_and_extract(url: str, target_dir: Path) -> None:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = target_dir / "vosk_model.zip"
+        try:
+            urlretrieve(url, zip_path)
+            with zipfile.ZipFile(zip_path) as z:
+                z.extractall(target_dir)
+        finally:
+            zip_path.unlink(missing_ok=True)
+
+    def _listen_blocking(self) -> None:
+        import vosk
+        rec = vosk.KaldiRecognizer(self._model, SAMPLE_RATE, self._grammar)
+        with sd.RawInputStream(
+            samplerate=SAMPLE_RATE,
+            blocksize=self.FRAME_SAMPLES,
+            dtype="int16",
+            channels=1,
+            device=self._settings.input_device,
+        ) as stream:
+            while True:
+                data, _overflowed = stream.read(self.FRAME_SAMPLES)
+                if rec.AcceptWaveform(bytes(data)):
+                    result = json.loads(rec.Result())
+                    text = result.get("text", "").strip().lower()
+                    if text and self._wake_phrase in text:
+                        return
+
+
+def make_wake_word(settings: Settings) -> WakeWord:
+    if settings.wake_backend == "vosk":
+        return VoskBackend(settings)
+    return OpenWakeWordBackend(settings)

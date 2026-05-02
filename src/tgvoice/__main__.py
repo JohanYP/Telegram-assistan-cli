@@ -11,7 +11,7 @@ from .player import Player
 from .recorder import Recorder
 from .telegram import IncomingText, IncomingVoice, Telegram
 from .tui import TUI
-from .wake_word import WakeWord
+from .wake_word import make_wake_word
 
 log = logging.getLogger(__name__)
 
@@ -58,8 +58,11 @@ async def _amain() -> None:
         except Exception as e:
             tui.print_error(f"no se pudo enviar: {e}")
 
-    tui.print_info(f"cargando wake word '{settings.wake_word}'… (puede tardar la primera vez)")
-    wake = WakeWord(settings)
+    tui.print_info(
+        f"cargando wake word '{settings.wake_word}' "
+        f"[backend={settings.wake_backend}]… (puede tardar la primera vez)"
+    )
+    wake = make_wake_word(settings)
     tui.print_info(f"di '{settings.wake_word.replace('_', ' ')}' para hablar por voz, o escribe abajo.")
 
     async def voice_loop() -> None:

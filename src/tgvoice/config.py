@@ -12,8 +12,10 @@ class Settings:
     api_id: int
     api_hash: str
     bot_username: str
+    wake_backend: str  # "openwakeword" | "vosk"
     wake_word: str
     wake_threshold: float
+    vosk_lang: str  # "es" | "en"
     vad_aggressiveness: int
     silence_timeout_ms: int
     max_recording_s: int
@@ -47,12 +49,18 @@ def load() -> Settings:
     input_device_raw = os.environ.get("INPUT_DEVICE", "").strip()
     input_device = int(input_device_raw) if input_device_raw else None
 
+    backend = os.environ.get("WAKE_BACKEND", "openwakeword").strip().lower()
+    if backend not in ("openwakeword", "vosk"):
+        raise SystemExit(f"WAKE_BACKEND inválido: {backend!r}. Usa 'openwakeword' o 'vosk'.")
+
     return Settings(
         api_id=api_id,
         api_hash=_require("API_HASH"),
         bot_username=bot,
+        wake_backend=backend,
         wake_word=os.environ.get("WAKE_WORD", "hey_jarvis").strip(),
         wake_threshold=float(os.environ.get("WAKE_THRESHOLD", "0.5")),
+        vosk_lang=os.environ.get("VOSK_LANG", "es").strip().lower(),
         vad_aggressiveness=int(os.environ.get("VAD_AGGRESSIVENESS", "2")),
         silence_timeout_ms=int(os.environ.get("SILENCE_TIMEOUT_MS", "1500")),
         max_recording_s=int(os.environ.get("MAX_RECORDING_S", "15")),

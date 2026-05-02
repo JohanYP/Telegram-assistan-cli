@@ -51,7 +51,9 @@ $EDITOR .env
 Completa:
 - `API_ID` y `API_HASH` (paso 1).
 - `BOT_USERNAME` con el `@username` de tu bot.
-- (opcional) `WAKE_WORD`: una de `hey_jarvis`, `alexa`, `hey_mycroft`, `hey_rhasspy`.
+- `WAKE_BACKEND` y `WAKE_WORD`:
+  - `WAKE_BACKEND=openwakeword` (default) — rápido y preciso, pero solo frases pre-entrenadas: `alexa`, `hey_jarvis`, `hey_mycroft`, `hey_rhasspy`.
+  - `WAKE_BACKEND=vosk` — reconoce **cualquier frase** que pongas en `WAKE_WORD` (p. ej. `hey il`, `oye lasis`). Descarga un modelo de ~40 MB la primera vez. `VOSK_LANG=es` o `en`.
 
 ## 4. Uso
 

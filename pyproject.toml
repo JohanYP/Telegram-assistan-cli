@@ -17,6 +17,8 @@ dependencies = [
     "scikit-learn>=1.3",
     "tqdm>=4.0",
     "requests>=2.0",
+    # Backend alternativo de wake word (frases custom como 'hey il').
+    "vosk>=0.3.45",
     "sounddevice>=0.4.6",
     "numpy>=1.24,<2.0",
     "webrtcvad-wheels>=2.0.14",
