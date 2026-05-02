@@ -510,6 +510,63 @@ async function installAutoplayObserver(page) {
       });
     }
 
+    function describeEl(el) {
+      if (!el) return { label: "", cls: "" };
+      const label = (
+        el.getAttribute?.("aria-label") ||
+        el.getAttribute?.("title") ||
+        el.textContent ||
+        ""
+      ).toLowerCase();
+      const cls = ((el.className && el.className.toString()) || "").toLowerCase();
+      return { label, cls };
+    }
+
+    // Detecta el estado del boton del mensaje de voz: "download", "play", "pause" o "unknown".
+    // Esto evita clickear ciegamente: si ya descargo, un solo click; si esta descargando, dos.
+    function getButtonState(node) {
+      const buttons = Array.from(node.querySelectorAll("button, [role='button']"));
+
+      for (const el of buttons) {
+        const { label, cls } = describeEl(el);
+        if (label.includes("pause") || label.includes("pausar") || label.includes("pausa")) {
+          return { state: "pause", el };
+        }
+        if (label.includes("download") || label.includes("descargar")) {
+          return { state: "download", el };
+        }
+      }
+      for (const el of buttons) {
+        const { label } = describeEl(el);
+        if (
+          label.includes("play") ||
+          label.includes("reproducir") ||
+          label.includes("voice")
+        ) {
+          return { state: "play", el };
+        }
+      }
+      for (const el of buttons) {
+        const { cls } = describeEl(el);
+        if (cls.includes("pause")) return { state: "pause", el };
+        if (cls.includes("download")) return { state: "download", el };
+      }
+      // Iconos descarga sueltos
+      const downloadIcon = node.querySelector(
+        ".tgico-download, .icon-download, [class*='download' i]"
+      );
+      if (downloadIcon) {
+        const btn = downloadIcon.closest?.("button, [role='button']") || downloadIcon;
+        return { state: "download", el: btn };
+      }
+      // Si llegamos aqui y existe un boton dentro del audio, su estado no se puede inferir.
+      const fallback =
+        node.querySelector(".Audio button, .voice-message button, .MediaVoice button, .media-inner button") ||
+        buttons[0] ||
+        null;
+      return { state: "unknown", el: fallback };
+    }
+
     function audioAlreadyStarted(messageNode) {
       if (messageNode.__tgStarted) return true;
       // Si hay un boton "Pause" visible, ya esta reproduciendose. No tocar.
@@ -523,6 +580,16 @@ async function installAutoplayObserver(page) {
         return true;
       }
       return false;
+    }
+
+    function forceAudioPlay(messageNode) {
+      const audio = messageNode.querySelector("audio");
+      if (!audio) return;
+      try {
+        audio.muted = false;
+        audio.volume = 1;
+        audio.play().catch(() => {});
+      } catch (_) {}
     }
 
     function tryPlay(messageNode, attempt) {
@@ -541,25 +608,62 @@ async function installAutoplayObserver(page) {
         messageNode.scrollIntoView?.({ block: "center", behavior: "auto" });
       }
 
-      // Si el audio ya inicio en algun reintento previo, no tocar el boton (es un toggle play/pause).
       if (audioAlreadyStarted(messageNode)) return true;
 
       const audio = messageNode.querySelector("audio");
       attachStartedListener(messageNode, audio);
 
-      const target = findClickable(messageNode);
-      if (target) fireClick(target);
+      const { state, el } = getButtonState(messageNode);
 
-      if (audio) {
-        try {
-          audio.muted = false;
-          audio.volume = 1;
-          audio.play().catch(() => {});
-        } catch (_) {}
+      if (state === "pause") {
+        // ya esta reproduciendose
+        messageNode.__tgStarted = true;
+        return true;
       }
 
-      // Maximo 2 clicks: el primero suele iniciar descarga, el segundo reproduce.
-      // hasPauseButton + listener playing/timeupdate frenan los reintentos si ya esta sonando.
+      if (state === "play") {
+        // Audio ya descargado (auto-download). Un solo click.
+        if (el) fireClick(el);
+        forceAudioPlay(messageNode);
+        return true;
+      }
+
+      if (state === "download") {
+        // Click descarga. Esperar y re-evaluar para clickear play una vez listo.
+        if (el) fireClick(el);
+        const waitAndPress = (delay, retries) => {
+          setTimeout(() => {
+            if (audioAlreadyStarted(messageNode)) return;
+            const next = getButtonState(messageNode);
+            if (next.state === "pause") {
+              messageNode.__tgStarted = true;
+              return;
+            }
+            if (next.state === "play" && next.el) {
+              fireClick(next.el);
+              forceAudioPlay(messageNode);
+              return;
+            }
+            if (next.state === "download" && retries > 0) {
+              // Descarga aun en curso, esperar mas.
+              waitAndPress(1500, retries - 1);
+              return;
+            }
+            // unknown: clickear lo que haya como fallback (un solo intento).
+            if (next.el && retries > 0) {
+              fireClick(next.el);
+              forceAudioPlay(messageNode);
+            }
+          }, delay);
+        };
+        waitAndPress(1200, 2);
+        return true;
+      }
+
+      // state === "unknown": no podemos inferir el estado del boton.
+      // Mantenemos el comportamiento previo: click + 1 retry a 1500ms.
+      if (el) fireClick(el);
+      forceAudioPlay(messageNode);
       if (attempt < 1) {
         setTimeout(() => tryPlay(messageNode, attempt + 1), 1500);
       }
