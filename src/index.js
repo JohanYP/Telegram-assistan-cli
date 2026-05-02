@@ -394,75 +394,28 @@ async function seedSeenMessages(page) {
   }
 }
 
+// Marca los voice messages existentes en el DOM como "ya procesados"
+// (data-tg-played-voice="1") para que processVoicePending no los reproduzca
+// al arrancar. Solo corre una vez por sesion.
 async function installAutoplayObserver(page) {
-  // Solo detectamos voice messages nuevos y los encolamos. El click real lo
-  // hace Node con page.click() para producir eventos isTrusted=true; los
-  // eventos sinteticos (dispatchEvent) en headless no disparan los listeners
-  // de Telegram que requieren user gesture confiable.
   await page.evaluate(() => {
-    if (window.__tgAutoplayInstalled) return;
-    window.__tgAutoplayInstalled = true;
-    window.__tgPlayedIds = new Set();
-    window.__tgVoicePending = window.__tgVoicePending || [];
-    let __tgIdCounter = 0;
+    if (window.__tgObsInstalled) return;
+    window.__tgObsInstalled = true;
 
-    function isIncomingVoiceMessage(messageNode) {
-      if (!messageNode) return false;
-      const isOwn =
-        messageNode.classList.contains("own") ||
-        messageNode.classList.contains("is-out") ||
-        messageNode.matches?.(".message-out, .is-outgoing");
-      if (isOwn) return false;
-      return !!messageNode.querySelector(
-        ".voice-message, .is-voice, .Audio, .MediaVoice, audio"
-      );
-    }
+    const isOwn = (m) =>
+      m.classList.contains("own") ||
+      m.classList.contains("is-out") ||
+      (m.matches && m.matches(".message-out, .is-outgoing"));
+    const hasVoice = (m) =>
+      !!m.querySelector(".voice-message, .is-voice, .Audio, .MediaVoice, audio");
 
-    function getMessageKey(messageNode) {
-      const id =
-        messageNode.getAttribute("data-message-id") ||
-        messageNode.getAttribute("data-mid") ||
-        messageNode.id ||
-        "";
-      if (id) return "id:" + id;
-      // Como fallback, asignamos un id sintetico estable al nodo.
-      if (!messageNode.__tgKey) {
-        messageNode.__tgKey = "syn:" + (++__tgIdCounter);
-      }
-      return messageNode.__tgKey;
-    }
-
-    function enqueue(messageNode) {
-      const key = getMessageKey(messageNode);
-      if (window.__tgPlayedIds.has(key)) return;
-      window.__tgPlayedIds.add(key);
-      messageNode.setAttribute("data-tg-pending", key);
-      window.__tgVoicePending.push(key);
-    }
-
-    // Marcar historico como visto para no auto-reproducirlo al arrancar.
-    document.querySelectorAll("[data-message-id], .message").forEach((m) => {
-      if (!isIncomingVoiceMessage(m)) return;
-      window.__tgPlayedIds.add(getMessageKey(m));
-    });
-
-    const observer = new MutationObserver((mutations) => {
-      for (const m of mutations) {
-        if (!m.addedNodes || !m.addedNodes.length) continue;
-        for (const n of m.addedNodes) {
-          if (n.nodeType !== 1) continue;
-          const msg = n.closest?.("[data-message-id], .message") || n;
-          if (isIncomingVoiceMessage(msg)) {
-            enqueue(msg);
-          }
-        }
-      }
-    });
-
-    observer.observe(document.body, {
-      childList: true,
-      subtree: true,
-    });
+    document
+      .querySelectorAll("[data-message-id], [data-mid], .message, .Message")
+      .forEach((m) => {
+        if (isOwn(m)) return;
+        if (!hasVoice(m)) return;
+        m.setAttribute("data-tg-played-voice", "1");
+      });
   });
 }
 
@@ -572,50 +525,37 @@ async function playVoice(page, key) {
 }
 
 async function processVoicePending(page) {
+  // Escanea el DOM por voice messages externos sin la marca
+  // data-tg-played-voice="1". Los marca, les asigna data-tg-pending=KEY y
+  // los devuelve para que Node les haga page.click trusted.
   const pending = await page
     .evaluate(() => {
-      if (!window.__tgVoicePending) window.__tgVoicePending = [];
-      if (!window.__tgPlayedIds) window.__tgPlayedIds = new Set();
+      let counter = window.__tgVoiceKeyCounter || 0;
+      const queue = [];
 
-      const queue = window.__tgVoicePending.splice(0);
-
-      // Adicional: escanear DOM por voice messages no marcados aun.
-      // Cubre los casos donde el MutationObserver perdio el evento (por
-      // ejemplo, mensaje insertado antes de instalar el observer, o cambiado
-      // por mutacion de attributes que el observer no escucha).
-      let counter = 0;
-      document.querySelectorAll("[data-message-id], .message").forEach((m) => {
+      const candidates = document.querySelectorAll(
+        "[data-message-id], [data-mid], .message, .Message"
+      );
+      candidates.forEach((m) => {
         const isOwn =
           m.classList.contains("own") ||
           m.classList.contains("is-out") ||
           (m.matches && m.matches(".message-out, .is-outgoing"));
         if (isOwn) return;
+        if (m.getAttribute("data-tg-played-voice") === "1") return;
         const hasVoice = !!m.querySelector(
           ".voice-message, .is-voice, .Audio, .MediaVoice, audio"
         );
         if (!hasVoice) return;
 
-        const rawId =
-          m.getAttribute("data-message-id") ||
-          m.getAttribute("data-mid") ||
-          m.id ||
-          "";
-        let key = rawId ? "id:" + rawId : "";
-        if (!key) {
-          if (m.__tgKey) key = m.__tgKey;
-          else {
-            counter += 1;
-            m.__tgKey = "syn:" + counter + "_" + Date.now();
-            key = m.__tgKey;
-          }
-        }
-
-        if (window.__tgPlayedIds.has(key)) return;
-        window.__tgPlayedIds.add(key);
+        counter += 1;
+        const key = "v" + counter + "_" + Date.now();
+        m.setAttribute("data-tg-played-voice", "1");
         m.setAttribute("data-tg-pending", key);
         queue.push(key);
       });
 
+      window.__tgVoiceKeyCounter = counter;
       return queue;
     })
     .catch(() => []);
@@ -1081,7 +1021,6 @@ async function runSession() {
           await installAutoplayObserver(page);
           const incoming = await readNewMessages(page);
           let printedAny = false;
-          const voiceIdsToProcess = [];
           for (const msg of incoming) {
             if (seenIds.has(msg.id)) continue;
             seenIds.add(msg.id);
@@ -1097,35 +1036,13 @@ async function runSession() {
               lastBotResponse = msg.text;
             } else if (msg.hasVoice) {
               lastAudioEvent = "Mensaje de voz recibido.";
-              if (msg.dataMessageId) voiceIdsToProcess.push(msg.dataMessageId);
             }
             currentInputPreview = "";
             renderCliShell(currentInputPreview);
             printedAny = true;
           }
 
-          // Encolar voices detectados por el polling. No dependemos solo del
-          // MutationObserver, que puede perderse el evento.
-          if (voiceIdsToProcess.length) {
-            await page
-              .evaluate((ids) => {
-                if (!window.__tgPlayedIds) window.__tgPlayedIds = new Set();
-                if (!window.__tgVoicePending) window.__tgVoicePending = [];
-                for (const id of ids) {
-                  const key = "id:" + id;
-                  if (window.__tgPlayedIds.has(key)) continue;
-                  window.__tgPlayedIds.add(key);
-                  const node =
-                    document.querySelector(`[data-message-id="${id}"]`) ||
-                    document.querySelector(`[data-mid="${id}"]`);
-                  if (node) node.setAttribute("data-tg-pending", key);
-                  window.__tgVoicePending.push(key);
-                }
-              }, voiceIdsToProcess)
-              .catch(() => {});
-          }
-
-          // Procesar pendientes (encolados por polling, observer o scan).
+          // processVoicePending escanea el DOM directamente, no necesita IDs.
           processVoicePending(page).catch(() => {});
 
           if (printedAny) rl.prompt();
