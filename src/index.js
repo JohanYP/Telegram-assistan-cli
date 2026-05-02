@@ -479,43 +479,56 @@ async function playVoice(page, key) {
   if (info.state === "pause") return;
   if (info.state === "missing" || info.state === "error") return;
 
+  // Selector robusto: busca el boton dentro del nodo marcado.
+  const btnSel = `[data-tg-pending="${key}"] button, [data-tg-pending="${key}"] [role='button']`;
+
+  async function clickRobust() {
+    try {
+      await page.click(btnSel, { delay: 30, timeout: 5000 });
+      return true;
+    } catch (e) {
+      lastAudioEvent = `${keyShort}: click fallo (${(e.message || "").slice(0, 40)})`;
+      renderCliShell(currentInputPreview);
+      return false;
+    }
+  }
+
   const tsBefore = Date.now();
 
-  if (info.state === "play") {
-    await clickVoiceButton(page, key);
-  } else if (info.state === "download") {
-    await clickVoiceButton(page, key);
-    // Esperar a que la descarga termine y el estado pase a play.
+  lastAudioEvent = `${keyShort}: clickeando (${info.state})...`;
+  renderCliShell(currentInputPreview);
+  const firstOk = await clickRobust();
+  if (!firstOk) return;
+
+  if (info.state === "download") {
     for (let i = 0; i < 12; i += 1) {
       await wait(800);
       info = await readVoiceState(page, key);
       if (info.state === "pause") break;
       if (info.state === "play") {
-        await clickVoiceButton(page, key);
+        lastAudioEvent = `${keyShort}: descarga lista, click play...`;
+        renderCliShell(currentInputPreview);
+        await clickRobust();
         break;
       }
       if (info.state !== "download") break;
     }
-  } else {
-    await clickVoiceButton(page, key);
   }
 
-  // En headless el navegador no produce audio audible, asi que ademas leemos
-  // el blob capturado por los hooks (fetch/XHR/MSE/MediaRecorder) y lo
-  // pasamos a ffplay/mpv.
-  if (SYSTEM_PLAYER) {
-    const audio = await pollForNewAudio(page, tsBefore, 60000);
-    if (audio && audio.buf && audio.buf.length >= 200) {
-      playAudioBuffer(audio.buf);
-      lastAudioEvent = `Reproduciendo (${SYSTEM_PLAYER.bin}, ${(audio.buf.length / 1024).toFixed(0)} KB).`;
-    } else {
-      const debug = await page
-        .evaluate(() => (window.__tgAudioDebug || []).slice(-5).join(" | "))
-        .catch(() => "");
-      lastAudioEvent = `Audio: timeout. Hooks: [${debug}]`;
-    }
-    renderCliShell(currentInputPreview);
+  lastAudioEvent = `${keyShort}: esperando blob de audio...`;
+  renderCliShell(currentInputPreview);
+
+  const audio = await pollForNewAudio(page, tsBefore, 20000);
+  if (audio && audio.buf && audio.buf.length >= 200) {
+    playAudioBuffer(audio.buf);
+    lastAudioEvent = `Reproduciendo (${SYSTEM_PLAYER.bin}, ${(audio.buf.length / 1024).toFixed(0)} KB).`;
+  } else {
+    const debug = await page
+      .evaluate(() => (window.__tgAudioDebug || []).slice(-6).join(" | "))
+      .catch(() => "");
+    lastAudioEvent = `${keyShort}: timeout. Hooks=[${debug.slice(0, 110)}]`;
   }
+  renderCliShell(currentInputPreview);
 }
 
 async function processVoicePending(page) {
