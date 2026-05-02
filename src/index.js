@@ -741,10 +741,11 @@ async function installAudioInterceptor(page) {
 
   client.on("Network.responseReceived", async (event) => {
     try {
-      const { requestId, response } = event;
+      const { response } = event;
       const url = response.url || "";
       const headers = response.headers || {};
       const ct = (headers["content-type"] || headers["Content-Type"] || "").toLowerCase();
+      const cr = headers["content-range"] || headers["Content-Range"] || "";
 
       const looksAudio =
         ct.includes("audio/") ||
@@ -755,27 +756,22 @@ async function installAudioInterceptor(page) {
         /telegram|cdn|web\.telegram\.org|t\.me/i.test(url) || url.startsWith("blob:");
 
       if (!looksAudio || !looksTelegramCDN) return;
+
+      // Skip respuestas parciales (Range): solo procesamos cuando podamos
+      // obtener el archivo completo via refetch.
+      if (cr) {
+        lastAudioEvent = `Audio parcial detectado (Range: ${cr}). Esperando respuesta completa.`;
+        renderCliShell(currentInputPreview);
+        return;
+      }
+
       if (playedAudioUrls.has(url)) return;
       playedAudioUrls.add(url);
 
-      // 1) Intentar descarga completa via fetch desde la pagina.
-      let buf = await fetchFullAudioFromPage(page, url);
-      let source = "fetch completo";
-
-      // 2) Fallback: usar el body interceptado por CDP. Aunque sea un chunk
-      //    parcial, sigue siendo audio reproducible (mejor que nada).
-      if (!buf || buf.length < 200) {
-        const body = await client
-          .send("Network.getResponseBody", { requestId })
-          .catch(() => null);
-        if (body && body.body) {
-          buf = Buffer.from(body.body, body.base64Encoded ? "base64" : "utf8");
-          source = "chunk CDP";
-        }
-      }
+      const buf = await fetchFullAudioFromPage(page, url);
 
       if (!buf || buf.length < 200) {
-        lastAudioEvent = "No pude obtener el audio (descarga vacia).";
+        lastAudioEvent = "No pude obtener el audio completo (refetch fallo o vacio).";
         renderCliShell(currentInputPreview);
         return;
       }
@@ -790,7 +786,7 @@ async function installAudioInterceptor(page) {
         } catch (_) {}
       }
 
-      lastAudioEvent = `Reproduciendo (${SYSTEM_PLAYER.bin}, ${(buf.length / 1024).toFixed(0)} KB, ${source}).`;
+      lastAudioEvent = `Reproduciendo (${SYSTEM_PLAYER.bin}, ${(buf.length / 1024).toFixed(0)} KB).`;
       renderCliShell(currentInputPreview);
 
       const child = spawn(SYSTEM_PLAYER.bin, [...SYSTEM_PLAYER.args, file], {
