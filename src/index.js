@@ -582,6 +582,31 @@ async function fetchFullAudioFromPage(page, url) {
   return Buffer.from(dataUrl.slice(idx + 1), "base64");
 }
 
+async function fetchFullAudioFromNode(page, url) {
+  // Descarga el archivo desde Node con las cookies del browser. No hay CORS
+  // (Node no aplica CORS) y al no enviar Range header, el CDN responde con el
+  // archivo entero. URLs blob:/data: solo viven en la pagina, no se pueden
+  // pedir desde fuera.
+  if (url.startsWith("blob:") || url.startsWith("data:")) return null;
+  try {
+    const cookies = await page.cookies(url).catch(() => []);
+    const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    const userAgent = await page
+      .evaluate(() => navigator.userAgent)
+      .catch(() => "Mozilla/5.0");
+
+    const headers = { "User-Agent": userAgent };
+    if (cookieStr) headers["Cookie"] = cookieStr;
+
+    const res = await fetch(url, { headers });
+    if (!res.ok) return null;
+    const ab = await res.arrayBuffer();
+    return Buffer.from(ab);
+  } catch (_) {
+    return null;
+  }
+}
+
 async function installAudioInterceptor(page) {
   if (!SYSTEM_PLAYER) return;
 
@@ -609,13 +634,24 @@ async function installAudioInterceptor(page) {
       if (playedAudioUrls.has(url)) return;
       playedAudioUrls.add(url);
 
-      // El response interceptado puede ser un Range parcial (cuando el browser
-      // pide chunks). Refetcheamos sin Range desde la pagina para obtener el
-      // archivo completo usando las cookies/auth ya cargadas.
-      const buf = await fetchFullAudioFromPage(page, url);
+      // El response interceptado puede ser un Range parcial. Para obtener el
+      // archivo completo:
+      //   1. Descargar desde Node (sin CORS, sin Range header). Mas fiable.
+      //   2. Si falla (URL blob:, error de red), refetch desde la pagina
+      //      con credentials: include.
+      let buf = null;
+      let source = "";
+
+      buf = await fetchFullAudioFromNode(page, url);
+      if (buf && buf.length >= 200) source = "node";
 
       if (!buf || buf.length < 200) {
-        lastAudioEvent = "No pude obtener el audio completo (refetch fallo o vacio).";
+        buf = await fetchFullAudioFromPage(page, url);
+        if (buf && buf.length >= 200) source = "page";
+      }
+
+      if (!buf || buf.length < 200) {
+        lastAudioEvent = "No pude obtener el audio (Node y pagina fallaron).";
         renderCliShell(currentInputPreview);
         return;
       }
@@ -630,7 +666,7 @@ async function installAudioInterceptor(page) {
         } catch (_) {}
       }
 
-      lastAudioEvent = `Reproduciendo (${SYSTEM_PLAYER.bin}, ${(buf.length / 1024).toFixed(0)} KB).`;
+      lastAudioEvent = `Reproduciendo (${SYSTEM_PLAYER.bin}, ${(buf.length / 1024).toFixed(0)} KB, ${source}).`;
       renderCliShell(currentInputPreview);
 
       const child = spawn(SYSTEM_PLAYER.bin, [...SYSTEM_PLAYER.args, file], {
