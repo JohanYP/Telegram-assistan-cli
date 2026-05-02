@@ -29,6 +29,11 @@ async def _amain() -> None:
     settings = config.load()
     _setup_logging(settings.cache_dir)
 
+    # PID file para que `tgvoice-cancel` sepa a quién mandar la señal
+    # (atajo global desde el DE para cancelar la grabación sin foco).
+    pid_file = settings.cache_dir / "tgvoice.pid"
+    pid_file.write_text(str(os.getpid()))
+
     # Login interactivo ANTES de la TUI: Textual captura stdin y rompería
     # los input() que Telethon usa para pedir teléfono / código / 2FA.
     print(f"conectando a Telegram… (sesión: {settings.session_path.name})")
@@ -38,10 +43,18 @@ async def _amain() -> None:
     print(f"✓ conectado. hablando con @{settings.bot_username}\n")
 
     app = TgvoiceApp(settings, tg)
+
+    # SIGUSR1 = cancelar grabación en curso (lo manda tgvoice-cancel).
+    # Si llega antes de que recorder exista, action_cancel_recording es no-op.
+    def _on_sigusr1(_signum, _frame):
+        app.action_cancel_recording()
+    signal.signal(signal.SIGUSR1, _on_sigusr1)
+
     try:
         await app.run_async()
     finally:
         await app.cleanup()
+        pid_file.unlink(missing_ok=True)
 
 
 def _install_signal_handlers() -> None:

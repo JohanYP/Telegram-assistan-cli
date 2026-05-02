@@ -78,7 +78,25 @@ A partir de ahí:
 - Escribe en el prompt `›` para enviar texto.
 - Di la wake word para grabar y enviar audio.
 - Las respuestas del bot aparecen automáticamente; las de audio se reproducen solas.
-- `Ctrl+C` o `Ctrl+D` para salir.
+- `Esc` cancela la grabación en curso.
+- `Ctrl+C` para salir, `Ctrl+L` limpia el chat.
+
+### Cancelar grabación con la ventana en background
+
+Si tienes la ventana minimizada o sin foco, `Esc` no llega al proceso. Para esto se incluye el comando `tgvoice-cancel`, que manda `SIGUSR1` al `tgvoice` corriendo y aborta la grabación. Bindéalo en tu DE como atajo global:
+
+- **Hyprland** (`~/.config/hypr/hyprland.conf`):
+  ```
+  bind = ALT, X, exec, tgvoice-cancel
+  ```
+- **KDE**: System Settings → Shortcuts → Custom Shortcuts → Edit → New → Global Shortcut → Command/URL → `tgvoice-cancel`.
+- **GNOME**: Settings → Keyboard → Custom Shortcuts → `+` → Command: `tgvoice-cancel`, asigna la tecla.
+- **i3/sway** (`~/.config/i3/config` o `~/.config/sway/config`):
+  ```
+  bindsym Mod1+x exec tgvoice-cancel
+  ```
+
+Si `tgvoice-cancel` no aparece en `PATH`, usa la ruta absoluta del binario (típicamente `~/.local/bin/tgvoice-cancel` si hiciste el symlink, o `~/proyecto/.venv/bin/tgvoice-cancel` si no).
 
 ## 5. Solución de problemas
 

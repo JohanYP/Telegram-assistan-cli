@@ -28,6 +28,7 @@ dependencies = [
 
 [project.scripts]
 tgvoice = "tgvoice.__main__:run"
+tgvoice-cancel = "tgvoice.cancel:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]
