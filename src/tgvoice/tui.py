@@ -181,15 +181,13 @@ class TgvoiceApp(App):
             try:
                 self._set_status("💤 esperando wake word")
                 await self._wake.listen()
-                await asyncio.to_thread(sounds.play_ding)
+                sounds.play_ding()
                 self._set_status("🎙 grabando…")
                 wav = await self._recorder.record()
+                sounds.play_close()
                 if self._recorder.was_cancelled:
-                    # En cancelación no tocamos sonido: la pulsación es la
-                    # confirmación, y evitamos solapar con el próximo ding.
                     self.add_info("voz cancelada")
                     continue
-                await asyncio.to_thread(sounds.play_close)
                 if wav is None:
                     self.add_info("no detecté voz")
                     continue

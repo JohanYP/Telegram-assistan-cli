@@ -4,6 +4,7 @@ import logging
 import shutil
 import subprocess
 import tempfile
+import threading
 import wave
 from pathlib import Path
 
@@ -64,6 +65,21 @@ def _detect_player() -> list[str] | None:
 
 
 def _play(path: Path, label: str) -> None:
+    """Lanza el reproductor en un thread daemon. No bloquea al caller.
+
+    Why: si bloqueamos esperando que el ding/close termine, retrasamos
+    el inicio de la grabación o del próximo ciclo de wake word. El thread
+    reapéa el subprocess al terminar, así no acumulamos zombies.
+    """
+    threading.Thread(
+        target=_play_blocking,
+        args=(path, label),
+        daemon=True,
+        name=f"sound-{label}",
+    ).start()
+
+
+def _play_blocking(path: Path, label: str) -> None:
     global _PLAYER
     _ensure_files()
     if _PLAYER is None:
@@ -83,10 +99,10 @@ def _play(path: Path, label: str) -> None:
 
 
 def play_ding() -> None:
-    """Sonido al detectar la wake word (ascendente)."""
+    """Sonido al detectar la wake word (ascendente). No bloquea."""
     _play(_DING_PATH, "ding")
 
 
 def play_close() -> None:
-    """Sonido al cerrar la captura de voz (descendente)."""
+    """Sonido al cerrar la captura de voz (descendente). No bloquea."""
     _play(_CLOSE_PATH, "close")
