@@ -600,13 +600,13 @@ async function installAutoplayObserver(page) {
 }
 
 async function fetchFullAudioFromPage(page, url) {
-  // Re-descarga el archivo completo desde la pagina para evitar problemas con
-  // Range requests parciales (audios largos llegan en chunks; getResponseBody
-  // solo entrega el chunk actual).
+  // Re-descarga el archivo completo desde la pagina (con cookies/auth ya
+  // cargadas) para esquivar respuestas Range parciales del CDN. Puede fallar
+  // si la URL signed expiro o es cross-origin sin permisos.
   const dataUrl = await page
     .evaluate(async (u) => {
       try {
-        const res = await fetch(u, { credentials: "include", cache: "no-store" });
+        const res = await fetch(u, { credentials: "include" });
         if (!res.ok) return null;
         const blob = await res.blob();
         return await new Promise((resolve) => {
@@ -637,7 +637,7 @@ async function installAudioInterceptor(page) {
 
   client.on("Network.responseReceived", async (event) => {
     try {
-      const { response } = event;
+      const { requestId, response } = event;
       const url = response.url || "";
       const headers = response.headers || {};
       const ct = (headers["content-type"] || headers["Content-Type"] || "").toLowerCase();
@@ -654,8 +654,27 @@ async function installAudioInterceptor(page) {
       if (playedAudioUrls.has(url)) return;
       playedAudioUrls.add(url);
 
-      const buf = await fetchFullAudioFromPage(page, url);
-      if (!buf || buf.length < 200) return;
+      // 1) Intentar descarga completa via fetch desde la pagina.
+      let buf = await fetchFullAudioFromPage(page, url);
+      let source = "fetch completo";
+
+      // 2) Fallback: usar el body interceptado por CDP. Aunque sea un chunk
+      //    parcial, sigue siendo audio reproducible (mejor que nada).
+      if (!buf || buf.length < 200) {
+        const body = await client
+          .send("Network.getResponseBody", { requestId })
+          .catch(() => null);
+        if (body && body.body) {
+          buf = Buffer.from(body.body, body.base64Encoded ? "base64" : "utf8");
+          source = "chunk CDP";
+        }
+      }
+
+      if (!buf || buf.length < 200) {
+        lastAudioEvent = "No pude obtener el audio (descarga vacia).";
+        renderCliShell(currentInputPreview);
+        return;
+      }
 
       const file = path.join(os.tmpdir(), `tg-voice-${Date.now()}.ogg`);
       fs.writeFileSync(file, buf);
@@ -667,7 +686,7 @@ async function installAudioInterceptor(page) {
         } catch (_) {}
       }
 
-      lastAudioEvent = `Reproduciendo audio local (${SYSTEM_PLAYER.bin}, ${(buf.length / 1024).toFixed(0)} KB)...`;
+      lastAudioEvent = `Reproduciendo (${SYSTEM_PLAYER.bin}, ${(buf.length / 1024).toFixed(0)} KB, ${source}).`;
       renderCliShell(currentInputPreview);
 
       const child = spawn(SYSTEM_PLAYER.bin, [...SYSTEM_PLAYER.args, file], {
@@ -680,8 +699,9 @@ async function installAudioInterceptor(page) {
       setTimeout(() => {
         fs.unlink(file, () => {});
       }, 5 * 60 * 1000);
-    } catch (_) {
-      // ignore
+    } catch (err) {
+      lastAudioEvent = `Error de audio: ${err.message}`;
+      renderCliShell(currentInputPreview);
     }
   });
 }
