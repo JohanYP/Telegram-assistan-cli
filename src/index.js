@@ -427,6 +427,16 @@ async function installAutoplayObserver(page) {
       }
     }
 
+    function isPauseLabel(el) {
+      const label = (
+        el.getAttribute?.("aria-label") ||
+        el.getAttribute?.("title") ||
+        el.textContent ||
+        ""
+      ).toLowerCase();
+      return label.includes("pause") || label.includes("pausar") || label.includes("pausa");
+    }
+
     function findClickable(node) {
       const selectors = [
         "button[aria-label*='Play' i]",
@@ -452,18 +462,30 @@ async function installAutoplayObserver(page) {
         ".media-photo-progress button",
       ];
       for (const sel of selectors) {
-        const el = node.querySelector(sel);
-        if (el) return el;
+        const els = node.querySelectorAll(sel);
+        for (const el of els) {
+          if (isPauseLabel(el)) continue;
+          return el;
+        }
       }
       const container =
         node.matches?.(".Audio, .voice-message, .is-voice, .media-inner, .MediaVoice")
           ? node
           : node.querySelector?.(".Audio, .voice-message, .is-voice, .media-inner, .MediaVoice");
       if (container) {
-        const btn = container.querySelector("button, [role='button']");
-        if (btn) return btn;
+        const btns = container.querySelectorAll("button, [role='button']");
+        for (const btn of btns) {
+          if (isPauseLabel(btn)) continue;
+          return btn;
+        }
       }
       return null;
+    }
+
+    function hasPauseButton(node) {
+      const btns = node.querySelectorAll("button, [role='button']");
+      for (const b of btns) if (isPauseLabel(b)) return true;
+      return false;
     }
 
     function isIncomingVoiceMessage(messageNode) {
@@ -490,8 +512,13 @@ async function installAutoplayObserver(page) {
 
     function audioAlreadyStarted(messageNode) {
       if (messageNode.__tgStarted) return true;
+      // Si hay un boton "Pause" visible, ya esta reproduciendose. No tocar.
+      if (hasPauseButton(messageNode)) {
+        messageNode.__tgStarted = true;
+        return true;
+      }
       const audio = messageNode.querySelector("audio");
-      if (audio && (audio.currentTime > 0 || (!audio.paused && audio.readyState >= 2))) {
+      if (audio && (audio.currentTime > 0 || (audio.duration > 0 && !audio.paused))) {
         messageNode.__tgStarted = true;
         return true;
       }
@@ -531,10 +558,10 @@ async function installAutoplayObserver(page) {
         } catch (_) {}
       }
 
-      // Reintentos: el primer click puede iniciar la descarga; el siguiente reproduce.
-      // El listener "playing"/"timeupdate" frenara los reintentos en cuanto el audio arranque.
-      if (attempt < 3) {
-        setTimeout(() => tryPlay(messageNode, attempt + 1), 1000);
+      // Maximo 2 clicks: el primero suele iniciar descarga, el segundo reproduce.
+      // hasPauseButton + listener playing/timeupdate frenan los reintentos si ya esta sonando.
+      if (attempt < 1) {
+        setTimeout(() => tryPlay(messageNode, attempt + 1), 1500);
       }
       return true;
     }
