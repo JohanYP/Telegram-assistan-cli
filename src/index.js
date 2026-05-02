@@ -457,9 +457,14 @@ async function clickVoiceButton(page, key) {
 }
 
 async function playVoice(page, key) {
-  const keyShort = key.length > 30 ? key.slice(0, 30) + "..." : key;
+  const keyShort = key.length > 25 ? key.slice(0, 25) + "..." : key;
 
-  // Asegurar que el boton esta visible para que page.click pueda hacerlo.
+  if (!SYSTEM_PLAYER) {
+    lastAudioEvent = "Sin reproductor local. Instala ffplay/mpv/paplay.";
+    renderCliShell(currentInputPreview);
+    return;
+  }
+
   await page
     .evaluate((k) => {
       const node = document.querySelector(`[data-tg-pending="${k}"]`);
@@ -468,26 +473,11 @@ async function playVoice(page, key) {
     .catch(() => {});
 
   let info = await readVoiceState(page, key);
+  lastAudioEvent = `${keyShort}: estado=${info.state}`;
+  renderCliShell(currentInputPreview);
 
-  if (info.state === "pause") {
-    lastAudioEvent = `Audio ${keyShort}: ya estaba reproduciendose, no toco.`;
-    renderCliShell(currentInputPreview);
-    return;
-  }
-  if (info.state === "missing") {
-    lastAudioEvent = `Audio ${keyShort}: nodo no encontrado en DOM.`;
-    renderCliShell(currentInputPreview);
-    return;
-  }
-  if (info.state === "error") {
-    lastAudioEvent = `Audio ${keyShort}: error al leer estado.`;
-    renderCliShell(currentInputPreview);
-    return;
-  }
-  if (info.state === "no-wrapper") {
-    lastAudioEvent = `Audio ${keyShort}: sin wrapper. Click ciego.`;
-    renderCliShell(currentInputPreview);
-  }
+  if (info.state === "pause") return;
+  if (info.state === "missing" || info.state === "error") return;
 
   const tsBefore = Date.now();
 
@@ -576,18 +566,21 @@ async function processVoicePending(page) {
     })
     .catch(() => ({ queue: [], total: 0, owned: 0, alreadyMarked: 0 }));
 
-  // Diagnostico: si encontramos audios pero todos estan marcados, lo logueamos.
-  if (
-    result.queue.length === 0 &&
-    result.total > 0 &&
-    result.alreadyMarked === result.total
-  ) {
-    // No actualizamos lastAudioEvent aqui para no spammear el polling.
+  if (result.queue.length > 0) {
+    lastAudioEvent = `Scan: ${result.total} audios, ${result.alreadyMarked} marcados, ${result.queue.length} nuevos. Procesando...`;
+    renderCliShell(currentInputPreview);
+  } else if (result.total === 0) {
+    // No hay .Audio en absoluto: posible problema de selector.
+    // (Lo dejamos sin tocar el panel para no spammear cada 1.2s.)
   }
 
   for (const key of result.queue) {
-    // Un voice por vez para que ffplay no se solape entre dos audios.
-    await playVoice(page, key).catch(() => {});
+    try {
+      await playVoice(page, key);
+    } catch (err) {
+      lastAudioEvent = `playVoice ERROR: ${(err && err.message) || err}`;
+      renderCliShell(currentInputPreview);
+    }
   }
 }
 
@@ -816,6 +809,10 @@ function playAudioBuffer(buf) {
   const child = spawn(SYSTEM_PLAYER.bin, [...SYSTEM_PLAYER.args, file], {
     stdio: "ignore",
     detached: true,
+  });
+  child.on("error", (err) => {
+    lastAudioEvent = `${SYSTEM_PLAYER.bin} ERROR: ${err.message}`;
+    renderCliShell(currentInputPreview);
   });
   currentAudioChild = child;
   child.unref();
