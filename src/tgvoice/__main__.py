@@ -75,6 +75,7 @@ async def _amain() -> None:
                 await asyncio.to_thread(sounds.play_ding)
                 tui.set_status("🎙 grabando…")
                 wav = await recorder.record()
+                await asyncio.to_thread(sounds.play_close)
                 if wav is None:
                     tui.print_info("no detecté voz; vuelvo a escuchar")
                     continue

@@ -22,17 +22,25 @@ def _tone(freq: float, duration_ms: int, volume: float = 0.25) -> np.ndarray:
     return wave
 
 
-# Ding doble: tono bajo seguido de uno alto.
+# Ding doble ascendente: marca el inicio de la captura de voz.
 _DING = np.concatenate([_tone(880, 70), _tone(1320, 110)])
+# Tono doble descendente: marca el cierre de la captura.
+_CLOSE = np.concatenate([_tone(1320, 70), _tone(660, 110)])
+
+
+def _play(buffer: np.ndarray, label: str) -> None:
+    try:
+        sd.play(buffer, _SAMPLE_RATE)
+        sd.wait()
+    except sd.PortAudioError as e:
+        log.warning("no se pudo reproducir %s: %s", label, e)
 
 
 def play_ding() -> None:
-    """Reproduce un ding corto (~180 ms) y bloquea hasta terminar.
+    """Sonido al detectar la wake word (subiendo)."""
+    _play(_DING, "ding")
 
-    Bloquear evita que el ding entre en la grabación que arranca después.
-    """
-    try:
-        sd.play(_DING, _SAMPLE_RATE)
-        sd.wait()
-    except sd.PortAudioError as e:
-        log.warning("no se pudo reproducir el ding: %s", e)
+
+def play_close() -> None:
+    """Sonido al cerrar la captura de voz (bajando)."""
+    _play(_CLOSE, "close")
