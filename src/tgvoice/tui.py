@@ -184,12 +184,14 @@ class TgvoiceApp(App):
                 await asyncio.to_thread(sounds.play_ding)
                 self._set_status("🎙 grabando…")
                 wav = await self._recorder.record()
+                if self._recorder.was_cancelled:
+                    # En cancelación no tocamos sonido: la pulsación es la
+                    # confirmación, y evitamos solapar con el próximo ding.
+                    self.add_info("voz cancelada")
+                    continue
                 await asyncio.to_thread(sounds.play_close)
                 if wav is None:
-                    if self._recorder.was_cancelled:
-                        self.add_info("voz cancelada")
-                    else:
-                        self.add_info("no detecté voz")
+                    self.add_info("no detecté voz")
                     continue
                 self._set_status("🎚 codificando…")
                 try:
