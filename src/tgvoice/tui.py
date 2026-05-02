@@ -131,6 +131,10 @@ class TgvoiceApp(App):
 
     async def _startup(self) -> None:
         try:
+            # Pre-abrir el output stream ANTES de que cualquier input stream
+            # (wake word/recorder) tome el device. Si no, el primer ding/close
+            # se queda en cola hasta que el input se cierre.
+            await asyncio.to_thread(sounds.prewarm)
             self.add_info(f"conectado. hablando con @{self._settings.bot_username}")
             self._player = Player()
             await self._player.start()
@@ -225,6 +229,7 @@ class TgvoiceApp(App):
             await self._player.stop()
         if self._tg:
             await self._tg.disconnect()
+        sounds.stop()
 
     # UI helpers (síncronos: el mount se encola y se procesa en orden).
 

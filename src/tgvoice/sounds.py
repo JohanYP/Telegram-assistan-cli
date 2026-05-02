@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import logging
-import shutil
-import subprocess
-import tempfile
 import threading
-import wave
-from pathlib import Path
+from contextlib import suppress
 
 import numpy as np
+import sounddevice as sd
 
 log = logging.getLogger(__name__)
 
@@ -27,82 +24,85 @@ def _tone(freq: float, duration_ms: int, volume: float = 0.25) -> np.ndarray:
     return wave_arr
 
 
-_DING = np.concatenate([_tone(880, 70), _tone(1320, 110)])
-_CLOSE = np.concatenate([_tone(1320, 70), _tone(660, 110)])
-
-_TMP = Path(tempfile.gettempdir())
-_DING_PATH = _TMP / "tgvoice_ding.wav"
-_CLOSE_PATH = _TMP / "tgvoice_close.wav"
-
-_PLAYER: list[str] | None = None  # se resuelve la primera vez
+def _to_pcm16(samples: np.ndarray) -> bytes:
+    return (samples * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
 
 
-def _write_wav(path: Path, samples: np.ndarray) -> None:
-    pcm = (samples * 32767).clip(-32768, 32767).astype(np.int16)
-    with wave.open(str(path), "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(_SAMPLE_RATE)
-        wf.writeframes(pcm.tobytes())
+_DING = _to_pcm16(np.concatenate([_tone(880, 70), _tone(1320, 110)]))
+_CLOSE = _to_pcm16(np.concatenate([_tone(1320, 70), _tone(660, 110)]))
 
 
-def _ensure_files() -> None:
-    if not _DING_PATH.exists():
-        _write_wav(_DING_PATH, _DING)
-    if not _CLOSE_PATH.exists():
-        _write_wav(_CLOSE_PATH, _CLOSE)
+# OutputStream persistente. Cada play_*() solo escribe bytes a un stream
+# ya conectado al device, sin overhead de spawn de proceso (paplay/ffplay
+# = 100-500 ms) ni de apertura de stream nuevo.
+#
+# Why: en una versión previa se usaba sd.play() ad-hoc y los sonidos
+# quedaban en cola mientras el RawInputStream del wake word/recorder tenía
+# el device abierto, soltándose todos juntos al cerrarlo. Pre-abriendo el
+# OutputStream ANTES del primer InputStream esa serialización no aplica:
+# el stream ya está establecido cuando el input se abre.
+_stream: sd.RawOutputStream | None = None
+_open_lock = threading.Lock()
+_write_lock = threading.Lock()
 
 
-def _detect_player() -> list[str] | None:
-    """Reproductor más ligero disponible. paplay > ffplay > aplay."""
-    if shutil.which("paplay"):
-        return ["paplay"]
-    if shutil.which("ffplay"):
-        return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]
-    if shutil.which("aplay"):
-        return ["aplay", "-q"]
-    return None
+def prewarm() -> None:
+    """Abre el output stream. Llamar al inicio, antes de los input streams."""
+    global _stream
+    with _open_lock:
+        if _stream is not None:
+            return
+        try:
+            s = sd.RawOutputStream(
+                samplerate=_SAMPLE_RATE,
+                channels=1,
+                dtype="int16",
+                latency="low",
+            )
+            s.start()
+            _stream = s
+        except Exception as e:
+            log.warning("no se pudo abrir output stream: %s", e)
 
 
-def _play(path: Path, label: str) -> None:
-    """Lanza el reproductor en un thread daemon. No bloquea al caller.
+def stop() -> None:
+    """Cierra el output stream. Llamar al apagar la app."""
+    global _stream
+    with _open_lock:
+        if _stream is None:
+            return
+        with suppress(Exception):
+            _stream.stop()
+            _stream.close()
+        _stream = None
 
-    Why: si bloqueamos esperando que el ding/close termine, retrasamos
-    el inicio de la grabación o del próximo ciclo de wake word. El thread
-    reapéa el subprocess al terminar, así no acumulamos zombies.
-    """
+
+def _play_blocking(data: bytes, label: str) -> None:
+    if _stream is None:
+        prewarm()
+    if _stream is None:
+        return
+    try:
+        with _write_lock:
+            _stream.write(data)
+    except Exception as e:
+        log.warning("fallo al reproducir %s: %s", label, e)
+
+
+def _play(data: bytes, label: str) -> None:
     threading.Thread(
         target=_play_blocking,
-        args=(path, label),
+        args=(data, label),
         daemon=True,
         name=f"sound-{label}",
     ).start()
 
 
-def _play_blocking(path: Path, label: str) -> None:
-    global _PLAYER
-    _ensure_files()
-    if _PLAYER is None:
-        _PLAYER = _detect_player()
-        if _PLAYER is None:
-            log.warning("no encontré paplay/ffplay/aplay para reproducir %s", label)
-            return
-    try:
-        subprocess.run(
-            _PLAYER + [str(path)],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as e:
-        log.warning("no se pudo reproducir %s: %s", label, e)
-
-
 def play_ding() -> None:
     """Sonido al detectar la wake word (ascendente). No bloquea."""
-    _play(_DING_PATH, "ding")
+    _play(_DING, "ding")
 
 
 def play_close() -> None:
     """Sonido al cerrar la captura de voz (descendente). No bloquea."""
-    _play(_CLOSE_PATH, "close")
+    _play(_CLOSE, "close")
