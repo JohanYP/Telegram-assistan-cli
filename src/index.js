@@ -500,6 +500,8 @@ async function clickVoiceButton(page, key) {
 }
 
 async function playVoice(page, key) {
+  const keyShort = key.length > 30 ? key.slice(0, 30) + "..." : key;
+
   // Asegurar que el boton esta visible para que page.click pueda hacerlo.
   await page
     .evaluate((k) => {
@@ -509,7 +511,26 @@ async function playVoice(page, key) {
     .catch(() => {});
 
   let info = await readVoiceState(page, key);
-  if (info.state === "pause" || info.state === "missing" || info.state === "error") return;
+
+  if (info.state === "pause") {
+    lastAudioEvent = `Audio ${keyShort}: ya estaba reproduciendose, no toco.`;
+    renderCliShell(currentInputPreview);
+    return;
+  }
+  if (info.state === "missing") {
+    lastAudioEvent = `Audio ${keyShort}: nodo no encontrado en DOM.`;
+    renderCliShell(currentInputPreview);
+    return;
+  }
+  if (info.state === "error") {
+    lastAudioEvent = `Audio ${keyShort}: error al leer estado.`;
+    renderCliShell(currentInputPreview);
+    return;
+  }
+  if (info.state === "no-wrapper") {
+    lastAudioEvent = `Audio ${keyShort}: sin wrapper. Click ciego.`;
+    renderCliShell(currentInputPreview);
+  }
 
   const tsBefore = Date.now();
 
@@ -553,15 +574,54 @@ async function playVoice(page, key) {
 async function processVoicePending(page) {
   const pending = await page
     .evaluate(() => {
-      if (!window.__tgVoicePending || !window.__tgVoicePending.length) return [];
-      const taken = window.__tgVoicePending.splice(0);
-      return taken;
+      if (!window.__tgVoicePending) window.__tgVoicePending = [];
+      if (!window.__tgPlayedIds) window.__tgPlayedIds = new Set();
+
+      const queue = window.__tgVoicePending.splice(0);
+
+      // Adicional: escanear DOM por voice messages no marcados aun.
+      // Cubre los casos donde el MutationObserver perdio el evento (por
+      // ejemplo, mensaje insertado antes de instalar el observer, o cambiado
+      // por mutacion de attributes que el observer no escucha).
+      let counter = 0;
+      document.querySelectorAll("[data-message-id], .message").forEach((m) => {
+        const isOwn =
+          m.classList.contains("own") ||
+          m.classList.contains("is-out") ||
+          (m.matches && m.matches(".message-out, .is-outgoing"));
+        if (isOwn) return;
+        const hasVoice = !!m.querySelector(
+          ".voice-message, .is-voice, .Audio, .MediaVoice, audio"
+        );
+        if (!hasVoice) return;
+
+        const rawId =
+          m.getAttribute("data-message-id") ||
+          m.getAttribute("data-mid") ||
+          m.id ||
+          "";
+        let key = rawId ? "id:" + rawId : "";
+        if (!key) {
+          if (m.__tgKey) key = m.__tgKey;
+          else {
+            counter += 1;
+            m.__tgKey = "syn:" + counter + "_" + Date.now();
+            key = m.__tgKey;
+          }
+        }
+
+        if (window.__tgPlayedIds.has(key)) return;
+        window.__tgPlayedIds.add(key);
+        m.setAttribute("data-tg-pending", key);
+        queue.push(key);
+      });
+
+      return queue;
     })
     .catch(() => []);
 
   for (const key of pending) {
-    // Un voice por vez para evitar que ffplay se solape entre dos audios.
-    // playVoice falla silenciosamente, no rompemos el polling.
+    // Un voice por vez para que ffplay no se solape entre dos audios.
     await playVoice(page, key).catch(() => {});
   }
 }
