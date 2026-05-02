@@ -39,7 +39,9 @@ def load() -> Settings:
     # Cargamos el .env desde la raíz del proyecto explícitamente para que
     # `tgvoice` funcione desde cualquier cwd (por ejemplo, vía symlink en
     # ~/.local/bin) sin depender del directorio donde se invoque.
-    load_dotenv(project_root / ".env")
+    # override=True: el .env siempre gana sobre variables del shell, así
+    # un API_ID exportado vacío en .bashrc no enmascara el valor real.
+    load_dotenv(project_root / ".env", override=True)
     cache_dir = project_root / ".cache"
     cache_dir.mkdir(exist_ok=True)
 
