@@ -15,6 +15,9 @@ SAMPLE_RATE = 16_000
 WAKE_FRAME_SAMPLES = 1280
 
 
+PREBUILT = ("alexa", "hey_jarvis", "hey_mycroft", "hey_rhasspy")
+
+
 class WakeWord:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -25,18 +28,24 @@ class WakeWord:
         except Exception:
             log.debug("download_models() no necesario o ya en cache.")
         from openwakeword.model import Model
-        self._model = Model(
-            wakeword_models=[settings.wake_word],
-            inference_framework="onnx",
-        )
-        loaded = list(getattr(self._model, "models", {}).keys())
-        if loaded and settings.wake_word not in loaded:
-            raise SystemExit(
-                f"Wake word '{settings.wake_word}' no se cargó. "
-                f"Modelos disponibles: {loaded}. "
-                f"Pre-entrenados típicos: alexa, hey_jarvis, hey_mycroft, hey_rhasspy."
+        try:
+            self._model = Model(
+                wakeword_models=[settings.wake_word],
+                inference_framework="onnx",
             )
-        log.info("Wake word lista: %s (modelos: %s)", settings.wake_word, loaded)
+        except Exception as e:
+            raise SystemExit(
+                f"No se pudo cargar la wake word '{settings.wake_word}': {e}\n"
+                f"Pre-entrenadas disponibles: {', '.join(PREBUILT)}.\n"
+                f"Para una palabra personalizada hay que entrenar un modelo aparte."
+            )
+        loaded = list(getattr(self._model, "models", {}).keys())
+        if not loaded or settings.wake_word not in loaded:
+            raise SystemExit(
+                f"Wake word '{settings.wake_word}' no se cargó (loaded={loaded}).\n"
+                f"Pre-entrenadas disponibles: {', '.join(PREBUILT)}."
+            )
+        log.info("Wake word lista: %s", settings.wake_word)
 
     async def listen(self) -> None:
         """Bloquea hasta que se detecte la wake word, entonces vuelve."""

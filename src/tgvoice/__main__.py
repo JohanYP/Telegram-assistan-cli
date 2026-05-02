@@ -117,8 +117,10 @@ def run() -> None:
         pass
     except SystemExit:
         raise
-    except Exception:
+    except Exception as e:
         logging.getLogger(__name__).exception("error fatal")
+        print(f"\n❌ {type(e).__name__}: {e}", file=sys.stderr)
+        print("   Detalle completo en .cache/tgvoice.log", file=sys.stderr)
         sys.exit(1)
 
 
