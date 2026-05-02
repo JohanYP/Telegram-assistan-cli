@@ -1079,11 +1079,9 @@ async function runSession() {
         if (resolved) return;
         try {
           await installAutoplayObserver(page);
-          // Disparar clicks trusted (page.click) en voice messages encolados
-          // por el observer. No bloquea el polling.
-          processVoicePending(page).catch(() => {});
           const incoming = await readNewMessages(page);
           let printedAny = false;
+          const voiceIdsToProcess = [];
           for (const msg of incoming) {
             if (seenIds.has(msg.id)) continue;
             seenIds.add(msg.id);
@@ -1099,11 +1097,37 @@ async function runSession() {
               lastBotResponse = msg.text;
             } else if (msg.hasVoice) {
               lastAudioEvent = "Mensaje de voz recibido.";
+              if (msg.dataMessageId) voiceIdsToProcess.push(msg.dataMessageId);
             }
             currentInputPreview = "";
             renderCliShell(currentInputPreview);
             printedAny = true;
           }
+
+          // Encolar voices detectados por el polling. No dependemos solo del
+          // MutationObserver, que puede perderse el evento.
+          if (voiceIdsToProcess.length) {
+            await page
+              .evaluate((ids) => {
+                if (!window.__tgPlayedIds) window.__tgPlayedIds = new Set();
+                if (!window.__tgVoicePending) window.__tgVoicePending = [];
+                for (const id of ids) {
+                  const key = "id:" + id;
+                  if (window.__tgPlayedIds.has(key)) continue;
+                  window.__tgPlayedIds.add(key);
+                  const node =
+                    document.querySelector(`[data-message-id="${id}"]`) ||
+                    document.querySelector(`[data-mid="${id}"]`);
+                  if (node) node.setAttribute("data-tg-pending", key);
+                  window.__tgVoicePending.push(key);
+                }
+              }, voiceIdsToProcess)
+              .catch(() => {});
+          }
+
+          // Procesar pendientes (encolados por polling, observer o scan).
+          processVoicePending(page).catch(() => {});
+
           if (printedAny) rl.prompt();
         } catch (_) {
           // silencioso
