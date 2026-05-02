@@ -483,6 +483,12 @@ async function installAutoplayObserver(page) {
     }
 
     function hasPauseButton(node) {
+      const w = node.querySelector(
+        ".toogle-play-wrapper, .toggle-play-wrapper, [class*='toogle-play'], [class*='toggle-play']"
+      );
+      if (w && /\bpause\b/.test((w.className || "").toString().toLowerCase())) {
+        return true;
+      }
       const btns = node.querySelectorAll("button, [role='button']");
       for (const b of btns) if (isPauseLabel(b)) return true;
       return false;
@@ -522,13 +528,37 @@ async function installAutoplayObserver(page) {
       return { label, cls };
     }
 
+    // Telegram Web "/a/" pone el estado actual en la CLASE del wrapper, no en
+    // el aria-label del boton (que siempre dice "Play audio"). Ej:
+    //   <div class="toogle-play-wrapper play">  -> mostrando icono play
+    //   <div class="toogle-play-wrapper pause"> -> mostrando icono pause (sonando)
+    //   <div class="toogle-play-wrapper loading"> -> descargando
+    // Nota: "toogle" con typo intencional, asi viene en el DOM real.
+    function getWrapperState(node) {
+      const wrapper = node.querySelector(
+        ".toogle-play-wrapper, .toggle-play-wrapper, [class*='toogle-play'], [class*='toggle-play']"
+      );
+      if (!wrapper) return null;
+      const cls = (wrapper.className || "").toString().toLowerCase();
+      const btn = wrapper.querySelector("button, [role='button']") || wrapper;
+      // pause primero: el wrapper puede tener varias clases combinadas.
+      if (/\bpause\b/.test(cls)) return { state: "pause", el: btn };
+      if (/\b(loading|download|progress)\b/.test(cls)) return { state: "download", el: btn };
+      if (/\bplay\b/.test(cls)) return { state: "play", el: btn };
+      return null;
+    }
+
     // Detecta el estado del boton del mensaje de voz: "download", "play", "pause" o "unknown".
-    // Esto evita clickear ciegamente: si ya descargo, un solo click; si esta descargando, dos.
     function getButtonState(node) {
+      // 1. Wrapper class -> fuente de verdad en Telegram Web.
+      const fromWrapper = getWrapperState(node);
+      if (fromWrapper) return fromWrapper;
+
       const buttons = Array.from(node.querySelectorAll("button, [role='button']"));
 
+      // 2. aria-label / title con palabra explicita.
       for (const el of buttons) {
-        const { label, cls } = describeEl(el);
+        const { label } = describeEl(el);
         if (label.includes("pause") || label.includes("pausar") || label.includes("pausa")) {
           return { state: "pause", el };
         }
@@ -546,12 +576,12 @@ async function installAutoplayObserver(page) {
           return { state: "play", el };
         }
       }
+      // 3. Clase del boton.
       for (const el of buttons) {
         const { cls } = describeEl(el);
         if (cls.includes("pause")) return { state: "pause", el };
         if (cls.includes("download")) return { state: "download", el };
       }
-      // Iconos descarga sueltos
       const downloadIcon = node.querySelector(
         ".tgico-download, .icon-download, [class*='download' i]"
       );
@@ -559,7 +589,6 @@ async function installAutoplayObserver(page) {
         const btn = downloadIcon.closest?.("button, [role='button']") || downloadIcon;
         return { state: "download", el: btn };
       }
-      // Si llegamos aqui y existe un boton dentro del audio, su estado no se puede inferir.
       const fallback =
         node.querySelector(".Audio button, .voice-message button, .MediaVoice button, .media-inner button") ||
         buttons[0] ||
@@ -745,7 +774,6 @@ async function installAudioInterceptor(page) {
       const url = response.url || "";
       const headers = response.headers || {};
       const ct = (headers["content-type"] || headers["Content-Type"] || "").toLowerCase();
-      const cr = headers["content-range"] || headers["Content-Range"] || "";
 
       const looksAudio =
         ct.includes("audio/") ||
@@ -756,18 +784,12 @@ async function installAudioInterceptor(page) {
         /telegram|cdn|web\.telegram\.org|t\.me/i.test(url) || url.startsWith("blob:");
 
       if (!looksAudio || !looksTelegramCDN) return;
-
-      // Skip respuestas parciales (Range): solo procesamos cuando podamos
-      // obtener el archivo completo via refetch.
-      if (cr) {
-        lastAudioEvent = `Audio parcial detectado (Range: ${cr}). Esperando respuesta completa.`;
-        renderCliShell(currentInputPreview);
-        return;
-      }
-
       if (playedAudioUrls.has(url)) return;
       playedAudioUrls.add(url);
 
+      // El response interceptado puede ser un Range parcial (cuando el browser
+      // pide chunks). Refetcheamos sin Range desde la pagina para obtener el
+      // archivo completo usando las cookies/auth ya cargadas.
       const buf = await fetchFullAudioFromPage(page, url);
 
       if (!buf || buf.length < 200) {
