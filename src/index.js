@@ -397,331 +397,67 @@ async function seedSeenMessages(page) {
 }
 
 async function installAutoplayObserver(page) {
+  // Solo detectamos voice messages nuevos y los encolamos. El click real lo
+  // hace Node con page.click() para producir eventos isTrusted=true; los
+  // eventos sinteticos (dispatchEvent) en headless no disparan los listeners
+  // de Telegram que requieren user gesture confiable.
   await page.evaluate(() => {
     if (window.__tgAutoplayInstalled) return;
     window.__tgAutoplayInstalled = true;
     window.__tgPlayedIds = new Set();
-
-    function fireClick(el) {
-      try {
-        const rect = el.getBoundingClientRect();
-        const x = rect.left + rect.width / 2;
-        const y = rect.top + rect.height / 2;
-        const opts = {
-          bubbles: true,
-          cancelable: true,
-          view: window,
-          clientX: x,
-          clientY: y,
-          button: 0,
-        };
-        el.dispatchEvent(new PointerEvent("pointerdown", opts));
-        el.dispatchEvent(new MouseEvent("mousedown", opts));
-        el.dispatchEvent(new PointerEvent("pointerup", opts));
-        el.dispatchEvent(new MouseEvent("mouseup", opts));
-        el.dispatchEvent(new MouseEvent("click", opts));
-      } catch (_) {
-        try {
-          el.click();
-        } catch (__) {}
-      }
-    }
-
-    function isPauseLabel(el) {
-      const label = (
-        el.getAttribute?.("aria-label") ||
-        el.getAttribute?.("title") ||
-        el.textContent ||
-        ""
-      ).toLowerCase();
-      return label.includes("pause") || label.includes("pausar") || label.includes("pausa");
-    }
-
-    function findClickable(node) {
-      const selectors = [
-        "button[aria-label*='Play' i]",
-        "button[aria-label*='Reproducir' i]",
-        "button[aria-label*='Voice' i]",
-        "button[aria-label*='Download' i]",
-        "button[aria-label*='Descargar' i]",
-        "button.toggle-play",
-        ".AudioPlayer-playButton",
-        ".play-pause-button",
-        ".Audio-playPauseButton",
-        ".audio-toggle",
-        ".play-btn",
-        ".MediaVoice button",
-        ".Audio button",
-        ".voice-message button",
-        ".media-inner button",
-        "[class*='download' i] button",
-        "[class*='Download' i]",
-        ".tgico-download",
-        ".icon-download",
-        ".message-media-progress",
-        ".media-photo-progress button",
-      ];
-      for (const sel of selectors) {
-        const els = node.querySelectorAll(sel);
-        for (const el of els) {
-          if (isPauseLabel(el)) continue;
-          return el;
-        }
-      }
-      const container =
-        node.matches?.(".Audio, .voice-message, .is-voice, .media-inner, .MediaVoice")
-          ? node
-          : node.querySelector?.(".Audio, .voice-message, .is-voice, .media-inner, .MediaVoice");
-      if (container) {
-        const btns = container.querySelectorAll("button, [role='button']");
-        for (const btn of btns) {
-          if (isPauseLabel(btn)) continue;
-          return btn;
-        }
-      }
-      return null;
-    }
-
-    function hasPauseButton(node) {
-      const w = node.querySelector(
-        ".toogle-play-wrapper, .toggle-play-wrapper, [class*='toogle-play'], [class*='toggle-play']"
-      );
-      if (w && /\bpause\b/.test((w.className || "").toString().toLowerCase())) {
-        return true;
-      }
-      const btns = node.querySelectorAll("button, [role='button']");
-      for (const b of btns) if (isPauseLabel(b)) return true;
-      return false;
-    }
+    window.__tgVoicePending = window.__tgVoicePending || [];
+    let __tgIdCounter = 0;
 
     function isIncomingVoiceMessage(messageNode) {
       if (!messageNode) return false;
       const isOwn =
         messageNode.classList.contains("own") ||
         messageNode.classList.contains("is-out") ||
-        messageNode.matches(".message-out, .is-outgoing");
+        messageNode.matches?.(".message-out, .is-outgoing");
       if (isOwn) return false;
       return !!messageNode.querySelector(
         ".voice-message, .is-voice, .Audio, .MediaVoice, audio"
       );
     }
 
-    function attachStartedListener(messageNode, audio) {
-      if (!audio || audio.__tgListenerAttached) return;
-      audio.__tgListenerAttached = true;
-      const markStarted = () => { messageNode.__tgStarted = true; };
-      audio.addEventListener("playing", markStarted);
-      audio.addEventListener("timeupdate", () => {
-        if (audio.currentTime > 0.15) markStarted();
-      });
-    }
-
-    function describeEl(el) {
-      if (!el) return { label: "", cls: "" };
-      const label = (
-        el.getAttribute?.("aria-label") ||
-        el.getAttribute?.("title") ||
-        el.textContent ||
-        ""
-      ).toLowerCase();
-      const cls = ((el.className && el.className.toString()) || "").toLowerCase();
-      return { label, cls };
-    }
-
-    // Telegram Web "/a/" pone el estado actual en la CLASE del wrapper, no en
-    // el aria-label del boton (que siempre dice "Play audio"). Ej:
-    //   <div class="toogle-play-wrapper play">  -> mostrando icono play
-    //   <div class="toogle-play-wrapper pause"> -> mostrando icono pause (sonando)
-    //   <div class="toogle-play-wrapper loading"> -> descargando
-    // Nota: "toogle" con typo intencional, asi viene en el DOM real.
-    function getWrapperState(node) {
-      const wrapper = node.querySelector(
-        ".toogle-play-wrapper, .toggle-play-wrapper, [class*='toogle-play'], [class*='toggle-play']"
-      );
-      if (!wrapper) return null;
-      const cls = (wrapper.className || "").toString().toLowerCase();
-      const btn = wrapper.querySelector("button, [role='button']") || wrapper;
-      // pause primero: el wrapper puede tener varias clases combinadas.
-      if (/\bpause\b/.test(cls)) return { state: "pause", el: btn };
-      if (/\b(loading|download|progress)\b/.test(cls)) return { state: "download", el: btn };
-      if (/\bplay\b/.test(cls)) return { state: "play", el: btn };
-      return null;
-    }
-
-    // Detecta el estado del boton del mensaje de voz: "download", "play", "pause" o "unknown".
-    function getButtonState(node) {
-      // 1. Wrapper class -> fuente de verdad en Telegram Web.
-      const fromWrapper = getWrapperState(node);
-      if (fromWrapper) return fromWrapper;
-
-      const buttons = Array.from(node.querySelectorAll("button, [role='button']"));
-
-      // 2. aria-label / title con palabra explicita.
-      for (const el of buttons) {
-        const { label } = describeEl(el);
-        if (label.includes("pause") || label.includes("pausar") || label.includes("pausa")) {
-          return { state: "pause", el };
-        }
-        if (label.includes("download") || label.includes("descargar")) {
-          return { state: "download", el };
-        }
-      }
-      for (const el of buttons) {
-        const { label } = describeEl(el);
-        if (
-          label.includes("play") ||
-          label.includes("reproducir") ||
-          label.includes("voice")
-        ) {
-          return { state: "play", el };
-        }
-      }
-      // 3. Clase del boton.
-      for (const el of buttons) {
-        const { cls } = describeEl(el);
-        if (cls.includes("pause")) return { state: "pause", el };
-        if (cls.includes("download")) return { state: "download", el };
-      }
-      const downloadIcon = node.querySelector(
-        ".tgico-download, .icon-download, [class*='download' i]"
-      );
-      if (downloadIcon) {
-        const btn = downloadIcon.closest?.("button, [role='button']") || downloadIcon;
-        return { state: "download", el: btn };
-      }
-      const fallback =
-        node.querySelector(".Audio button, .voice-message button, .MediaVoice button, .media-inner button") ||
-        buttons[0] ||
-        null;
-      return { state: "unknown", el: fallback };
-    }
-
-    function audioAlreadyStarted(messageNode) {
-      if (messageNode.__tgStarted) return true;
-      // Si hay un boton "Pause" visible, ya esta reproduciendose. No tocar.
-      if (hasPauseButton(messageNode)) {
-        messageNode.__tgStarted = true;
-        return true;
-      }
-      const audio = messageNode.querySelector("audio");
-      if (audio && (audio.currentTime > 0 || (audio.duration > 0 && !audio.paused))) {
-        messageNode.__tgStarted = true;
-        return true;
-      }
-      return false;
-    }
-
-    function forceAudioPlay(messageNode) {
-      const audio = messageNode.querySelector("audio");
-      if (!audio) return;
-      try {
-        audio.muted = false;
-        audio.volume = 1;
-        audio.play().catch(() => {});
-      } catch (_) {}
-    }
-
-    function tryPlay(messageNode, attempt) {
-      attempt = attempt || 0;
+    function getMessageKey(messageNode) {
       const id =
         messageNode.getAttribute("data-message-id") ||
         messageNode.getAttribute("data-mid") ||
         messageNode.id ||
         "";
-
-      if (attempt === 0) {
-        if (messageNode.dataset && messageNode.dataset.tgPlayedVoice === "1") return false;
-        if (id && window.__tgPlayedIds.has(id)) return false;
-        if (id) window.__tgPlayedIds.add(id);
-        if (messageNode.dataset) messageNode.dataset.tgPlayedVoice = "1";
-        messageNode.scrollIntoView?.({ block: "center", behavior: "auto" });
+      if (id) return "id:" + id;
+      // Como fallback, asignamos un id sintetico estable al nodo.
+      if (!messageNode.__tgKey) {
+        messageNode.__tgKey = "syn:" + (++__tgIdCounter);
       }
-
-      if (audioAlreadyStarted(messageNode)) return true;
-
-      const audio = messageNode.querySelector("audio");
-      attachStartedListener(messageNode, audio);
-
-      const { state, el } = getButtonState(messageNode);
-
-      if (state === "pause") {
-        // ya esta reproduciendose
-        messageNode.__tgStarted = true;
-        return true;
-      }
-
-      if (state === "play") {
-        // Audio ya descargado (auto-download). Un solo click.
-        if (el) fireClick(el);
-        forceAudioPlay(messageNode);
-        return true;
-      }
-
-      if (state === "download") {
-        // Click descarga. Esperar y re-evaluar para clickear play una vez listo.
-        if (el) fireClick(el);
-        const waitAndPress = (delay, retries) => {
-          setTimeout(() => {
-            if (audioAlreadyStarted(messageNode)) return;
-            const next = getButtonState(messageNode);
-            if (next.state === "pause") {
-              messageNode.__tgStarted = true;
-              return;
-            }
-            if (next.state === "play" && next.el) {
-              fireClick(next.el);
-              forceAudioPlay(messageNode);
-              return;
-            }
-            if (next.state === "download" && retries > 0) {
-              // Descarga aun en curso, esperar mas.
-              waitAndPress(1500, retries - 1);
-              return;
-            }
-            // unknown: clickear lo que haya como fallback (un solo intento).
-            if (next.el && retries > 0) {
-              fireClick(next.el);
-              forceAudioPlay(messageNode);
-            }
-          }, delay);
-        };
-        waitAndPress(1200, 2);
-        return true;
-      }
-
-      // state === "unknown": no podemos inferir el estado del boton.
-      // Mantenemos el comportamiento previo: click + 1 retry a 1500ms.
-      if (el) fireClick(el);
-      forceAudioPlay(messageNode);
-      if (attempt < 1) {
-        setTimeout(() => tryPlay(messageNode, attempt + 1), 1500);
-      }
-      return true;
+      return messageNode.__tgKey;
     }
 
-    const initialMsgs = document.querySelectorAll("[data-message-id], .message");
-    initialMsgs.forEach((m) => {
+    function enqueue(messageNode) {
+      const key = getMessageKey(messageNode);
+      if (window.__tgPlayedIds.has(key)) return;
+      window.__tgPlayedIds.add(key);
+      messageNode.setAttribute("data-tg-pending", key);
+      window.__tgVoicePending.push(key);
+    }
+
+    // Marcar historico como visto para no auto-reproducirlo al arrancar.
+    document.querySelectorAll("[data-message-id], .message").forEach((m) => {
       if (!isIncomingVoiceMessage(m)) return;
-      const id = m.getAttribute("data-message-id") || m.getAttribute("data-mid") || m.id || "";
-      if (id) window.__tgPlayedIds.add(id);
-      if (m.dataset) m.dataset.tgPlayedVoice = "1";
+      window.__tgPlayedIds.add(getMessageKey(m));
     });
 
     const observer = new MutationObserver((mutations) => {
-      let latestIncomingVoice = null;
       for (const m of mutations) {
-        if (m.addedNodes && m.addedNodes.length) {
-          for (const n of m.addedNodes) {
-            if (n.nodeType !== 1) continue;
-            const msg = n.closest?.("[data-message-id], .message") || n;
-            if (isIncomingVoiceMessage(msg)) {
-              latestIncomingVoice = msg;
-            }
+        if (!m.addedNodes || !m.addedNodes.length) continue;
+        for (const n of m.addedNodes) {
+          if (n.nodeType !== 1) continue;
+          const msg = n.closest?.("[data-message-id], .message") || n;
+          if (isIncomingVoiceMessage(msg)) {
+            enqueue(msg);
           }
         }
-      }
-      if (latestIncomingVoice) {
-        setTimeout(() => tryPlay(latestIncomingVoice), 40);
       }
     });
 
@@ -730,6 +466,92 @@ async function installAutoplayObserver(page) {
       subtree: true,
     });
   });
+}
+
+async function readVoiceState(page, key) {
+  return page
+    .evaluate((k) => {
+      const node = document.querySelector(`[data-tg-pending="${k}"]`);
+      if (!node) return { state: "missing" };
+      const wrapper = node.querySelector(
+        ".toogle-play-wrapper, .toggle-play-wrapper, [class*='toogle-play'], [class*='toggle-play']"
+      );
+      if (!wrapper) return { state: "no-wrapper" };
+      const cls = (wrapper.className || "").toString().toLowerCase();
+      let state = "unknown";
+      if (/\bpause\b/.test(cls)) state = "pause";
+      else if (/\b(loading|download|progress)\b/.test(cls)) state = "download";
+      else if (/\bplay\b/.test(cls)) state = "play";
+      // Asignar id estable al boton para click trusted.
+      const btn = wrapper.querySelector("button, [role='button']");
+      if (btn && !btn.getAttribute("data-tg-btn")) {
+        btn.setAttribute("data-tg-btn", k);
+      }
+      return { state };
+    }, key)
+    .catch(() => ({ state: "error" }));
+}
+
+async function clickVoiceButton(page, key) {
+  try {
+    await page.click(`[data-tg-btn="${key}"]`, { delay: 30 });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function playVoice(page, key) {
+  // Asegurar que el boton esta visible para que page.click pueda hacerlo.
+  await page
+    .evaluate((k) => {
+      const node = document.querySelector(`[data-tg-pending="${k}"]`);
+      node?.scrollIntoView?.({ block: "center", behavior: "auto" });
+    }, key)
+    .catch(() => {});
+
+  let info = await readVoiceState(page, key);
+  if (info.state === "pause" || info.state === "missing" || info.state === "error") return;
+
+  if (info.state === "play") {
+    await clickVoiceButton(page, key);
+    return;
+  }
+
+  if (info.state === "download") {
+    await clickVoiceButton(page, key);
+    // Esperar a que la descarga termine y el estado pase a play.
+    for (let i = 0; i < 12; i += 1) {
+      await wait(800);
+      info = await readVoiceState(page, key);
+      if (info.state === "pause") return;
+      if (info.state === "play") {
+        await clickVoiceButton(page, key);
+        return;
+      }
+      if (info.state !== "download") break;
+    }
+    return;
+  }
+
+  // unknown / no-wrapper: un click como fallback.
+  await clickVoiceButton(page, key);
+}
+
+async function processVoicePending(page) {
+  const pending = await page
+    .evaluate(() => {
+      if (!window.__tgVoicePending || !window.__tgVoicePending.length) return [];
+      const taken = window.__tgVoicePending.splice(0);
+      return taken;
+    })
+    .catch(() => []);
+
+  for (const key of pending) {
+    // Un voice por vez para evitar que ffplay se solape entre dos audios.
+    // playVoice falla silenciosamente, no rompemos el polling.
+    await playVoice(page, key).catch(() => {});
+  }
 }
 
 async function fetchFullAudioFromPage(page, url) {
@@ -1016,6 +838,9 @@ async function runSession() {
         if (resolved) return;
         try {
           await installAutoplayObserver(page);
+          // Disparar clicks trusted (page.click) en voice messages encolados
+          // por el observer. No bloquea el polling.
+          processVoicePending(page).catch(() => {});
           const incoming = await readNewMessages(page);
           let printedAny = false;
           for (const msg of incoming) {
