@@ -172,7 +172,7 @@ function renderCliShell(inputValue = "", spinnerText = "") {
   banner.push("");
 
   const responseBox = buildBox("✦ RESPUESTA // IL ASSISTANT", lastBotResponse, width, 4);
-  const audioBox = buildBox("♪ AUDIO", lastAudioEvent, width, 1, 2);
+  const audioBox = buildBox("♪ AUDIO", lastAudioEvent, width, 1, 5);
   const statusText = waitingBotReply
     ? spinnerText || "Procesando respuesta del bot..."
     : "Listo. Enter para enviar. /visible reabrir browser. /logout cerrar sesion. /salir terminar.";
@@ -551,10 +551,17 @@ async function playVoice(page, key) {
     playAudioBuffer(audio.buf);
     lastAudioEvent = `Reproduciendo (${SYSTEM_PLAYER.bin}, ${(audio.buf.length / 1024).toFixed(0)} KB).`;
   } else {
+    // Quitamos el timestamp para que quepa mas info y mostramos las ultimas
+    // 12 entries del log de hooks.
     const debug = await page
-      .evaluate(() => (window.__tgAudioDebug || []).slice(-6).join(" | "))
+      .evaluate(() =>
+        (window.__tgAudioDebug || [])
+          .slice(-12)
+          .map((s) => s.replace(/^\d+\s+/, ""))
+          .join(" | ")
+      )
       .catch(() => "");
-    lastAudioEvent = `${keyShort}: timeout. Hooks=[${debug.slice(0, 110)}]`;
+    lastAudioEvent = `${keyShort}: timeout. Hooks=[${debug}]`;
   }
   renderCliShell(currentInputPreview);
 }
