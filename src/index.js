@@ -396,25 +396,29 @@ async function seedSeenMessages(page) {
 
 // Marca los voice messages existentes en el DOM como "ya procesados"
 // (data-tg-played-voice="1") para que processVoicePending no los reproduzca
-// al arrancar. Solo corre una vez por sesion.
+// al arrancar. Trabaja directamente sobre los elementos .Audio /
+// .voice-message / etc. (que SI existen en el HTML real), subiendo el arbol
+// para descartar mensajes propios.
 async function installAutoplayObserver(page) {
   await page.evaluate(() => {
     if (window.__tgObsInstalled) return;
     window.__tgObsInstalled = true;
 
-    const isOwn = (m) =>
-      m.classList.contains("own") ||
-      m.classList.contains("is-out") ||
-      (m.matches && m.matches(".message-out, .is-outgoing"));
-    const hasVoice = (m) =>
-      !!m.querySelector(".voice-message, .is-voice, .Audio, .MediaVoice, audio");
+    function isInsideOwn(el) {
+      let cur = el;
+      while (cur && cur !== document.body) {
+        const cls = (cur.className || "").toString();
+        if (/\b(own|is-out|message-out|is-outgoing)\b/.test(cls)) return true;
+        cur = cur.parentElement;
+      }
+      return false;
+    }
 
     document
-      .querySelectorAll("[data-message-id], [data-mid], .message, .Message")
-      .forEach((m) => {
-        if (isOwn(m)) return;
-        if (!hasVoice(m)) return;
-        m.setAttribute("data-tg-played-voice", "1");
+      .querySelectorAll(".Audio, .voice-message, .is-voice, .MediaVoice, audio")
+      .forEach((a) => {
+        if (isInsideOwn(a)) return;
+        a.setAttribute("data-tg-played-voice", "1");
       });
   });
 }
@@ -525,42 +529,63 @@ async function playVoice(page, key) {
 }
 
 async function processVoicePending(page) {
-  // Escanea el DOM por voice messages externos sin la marca
+  // Escanea el DOM por elementos .Audio / .voice-message / etc. sin la marca
   // data-tg-played-voice="1". Los marca, les asigna data-tg-pending=KEY y
   // los devuelve para que Node les haga page.click trusted.
-  const pending = await page
+  const result = await page
     .evaluate(() => {
+      function isInsideOwn(el) {
+        let cur = el;
+        while (cur && cur !== document.body) {
+          const cls = (cur.className || "").toString();
+          if (/\b(own|is-out|message-out|is-outgoing)\b/.test(cls)) return true;
+          cur = cur.parentElement;
+        }
+        return false;
+      }
+
       let counter = window.__tgVoiceKeyCounter || 0;
       const queue = [];
 
-      const candidates = document.querySelectorAll(
-        "[data-message-id], [data-mid], .message, .Message"
+      const all = document.querySelectorAll(
+        ".Audio, .voice-message, .is-voice, .MediaVoice, audio"
       );
-      candidates.forEach((m) => {
-        const isOwn =
-          m.classList.contains("own") ||
-          m.classList.contains("is-out") ||
-          (m.matches && m.matches(".message-out, .is-outgoing"));
-        if (isOwn) return;
-        if (m.getAttribute("data-tg-played-voice") === "1") return;
-        const hasVoice = !!m.querySelector(
-          ".voice-message, .is-voice, .Audio, .MediaVoice, audio"
-        );
-        if (!hasVoice) return;
+      let total = 0;
+      let owned = 0;
+      let alreadyMarked = 0;
+      all.forEach((a) => {
+        total += 1;
+        if (a.getAttribute("data-tg-played-voice") === "1") {
+          alreadyMarked += 1;
+          return;
+        }
+        if (isInsideOwn(a)) {
+          owned += 1;
+          return;
+        }
 
         counter += 1;
         const key = "v" + counter + "_" + Date.now();
-        m.setAttribute("data-tg-played-voice", "1");
-        m.setAttribute("data-tg-pending", key);
+        a.setAttribute("data-tg-played-voice", "1");
+        a.setAttribute("data-tg-pending", key);
         queue.push(key);
       });
 
       window.__tgVoiceKeyCounter = counter;
-      return queue;
+      return { queue, total, owned, alreadyMarked };
     })
-    .catch(() => []);
+    .catch(() => ({ queue: [], total: 0, owned: 0, alreadyMarked: 0 }));
 
-  for (const key of pending) {
+  // Diagnostico: si encontramos audios pero todos estan marcados, lo logueamos.
+  if (
+    result.queue.length === 0 &&
+    result.total > 0 &&
+    result.alreadyMarked === result.total
+  ) {
+    // No actualizamos lastAudioEvent aqui para no spammear el polling.
+  }
+
+  for (const key of result.queue) {
     // Un voice por vez para que ffplay no se solape entre dos audios.
     await playVoice(page, key).catch(() => {});
   }
