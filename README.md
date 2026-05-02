@@ -32,11 +32,14 @@ Sacar credenciales de Telegram (una vez):
 ## 2. Instalación
 
 ```bash
-cd tgvoice
-python3 -m venv .venv
+cd Telegram-assistan-cli
+python3 -m venv .venv      # o: uv venv --python 3.12 .venv
 source .venv/bin/activate
 pip install -e .
+pip install --no-deps openwakeword
 ```
+
+> El segundo paso (`--no-deps`) es necesario porque `openwakeword` declara `tflite-runtime` como dep, y este último no tiene wheels para Python ≥ 3.12. Como en este proyecto fijamos `inference_framework="onnx"`, `tflite-runtime` no se usa en runtime; las demás deps de openwakeword (`onnxruntime`, `scipy`, `scikit-learn`, `tqdm`, `requests`) ya se instalan vía nuestro `pyproject.toml`.
 
 ## 3. Configuración
 
