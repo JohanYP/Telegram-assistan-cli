@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 import wave
 from pathlib import Path
@@ -22,10 +23,28 @@ LEADING_SILENCE_TIMEOUT_MS = 3_000
 class Recorder:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        self._cancel = threading.Event()
+        self._was_cancelled = False
+
+    def cancel(self) -> None:
+        """Marca la grabación en curso como cancelada. Idempotente y thread-safe."""
+        self._cancel.set()
+
+    @property
+    def was_cancelled(self) -> bool:
+        return self._was_cancelled
 
     async def record(self) -> Path | None:
         """Graba hasta detectar silencio o llegar al máximo. None si no hubo voz."""
-        return await asyncio.to_thread(self._record_blocking)
+        self._cancel.clear()
+        self._was_cancelled = False
+        result = await asyncio.to_thread(self._record_blocking)
+        if self._cancel.is_set():
+            self._was_cancelled = True
+            if result and result.exists():
+                result.unlink(missing_ok=True)
+            return None
+        return result
 
     def _record_blocking(self) -> Path | None:
         vad = webrtcvad.Vad(self._settings.vad_aggressiveness)
@@ -45,6 +64,8 @@ class Recorder:
                 device=self._settings.input_device,
             ) as stream:
                 while elapsed_ms < max_ms:
+                    if self._cancel.is_set():
+                        return None
                     data, _overflowed = stream.read(FRAME_SAMPLES)
                     chunk = bytes(data)
                     audio.extend(chunk)

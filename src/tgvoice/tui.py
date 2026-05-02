@@ -100,6 +100,7 @@ class TgvoiceApp(App):
 
     BINDINGS = [
         Binding("ctrl+c", "quit", "salir", priority=True),
+        Binding("escape", "cancel_recording", "cancelar voz", priority=True),
         Binding("ctrl+l", "clear_chat", "limpiar"),
     ]
 
@@ -185,7 +186,10 @@ class TgvoiceApp(App):
                 wav = await self._recorder.record()
                 await asyncio.to_thread(sounds.play_close)
                 if wav is None:
-                    self.add_info("no detecté voz")
+                    if self._recorder.was_cancelled:
+                        self.add_info("voz cancelada")
+                    else:
+                        self.add_info("no detecté voz")
                     continue
                 self._set_status("🎚 codificando…")
                 try:
@@ -246,6 +250,10 @@ class TgvoiceApp(App):
         chat = self.query_one("#chat", VerticalScroll)
         chat.mount(MessageBox(role, text, kind=kind))
         chat.scroll_end(animate=False)
+
+    def action_cancel_recording(self) -> None:
+        if self._recorder is not None:
+            self._recorder.cancel()
 
     async def action_clear_chat(self) -> None:
         chat = self.query_one("#chat", VerticalScroll)
