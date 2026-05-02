@@ -8,7 +8,7 @@ import sys
 import threading
 from pathlib import Path
 
-from . import config, encoder
+from . import config, encoder, sounds
 from .player import Player
 from .recorder import Recorder
 from .telegram import IncomingText, IncomingVoice, Telegram
@@ -72,6 +72,7 @@ async def _amain() -> None:
             try:
                 tui.set_status("💤 esperando wake word")
                 await wake.listen()
+                await asyncio.to_thread(sounds.play_ding)
                 tui.set_status("🎙 grabando…")
                 wav = await recorder.record()
                 if wav is None:
