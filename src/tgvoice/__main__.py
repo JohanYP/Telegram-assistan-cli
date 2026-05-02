@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
+import threading
 from pathlib import Path
 
 from . import config, encoder
@@ -113,7 +115,23 @@ async def _amain() -> None:
         tui.print_info("hasta luego.")
 
 
+def _install_signal_handlers() -> None:
+    # Cuando el terminal se cierra (SIGHUP) o nos mandan SIGTERM, asyncio
+    # intenta limpiar pero el thread de PortAudio se queda bloqueado en
+    # stream.read() y el executor espera por el indefinidamente. Resultado:
+    # proceso zombie que tira la responsividad del sistema. Programamos un
+    # os._exit() forzoso a los 2s y disparamos KeyboardInterrupt para que
+    # asyncio empiece a salir.
+    def _handler(signum, _frame):
+        threading.Timer(2.0, lambda: os._exit(0)).start()
+        raise KeyboardInterrupt
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, _handler)
+
+
 def run() -> None:
+    _install_signal_handlers()
+    exit_code = 0
     try:
         asyncio.run(_amain())
     except KeyboardInterrupt:
@@ -124,7 +142,10 @@ def run() -> None:
         logging.getLogger(__name__).exception("error fatal")
         print(f"\n❌ {type(e).__name__}: {e}", file=sys.stderr)
         print("   Detalle completo en .cache/tgvoice.log", file=sys.stderr)
-        sys.exit(1)
+        exit_code = 1
+    # os._exit en vez de sys.exit: salta el shutdown del executor por si
+    # quedo algun thread de PortAudio bloqueado en read().
+    os._exit(exit_code)
 
 
 if __name__ == "__main__":
