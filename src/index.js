@@ -808,7 +808,6 @@ async function runSession() {
             if (msg.text) {
               lastBotResponse = msg.text;
             } else if (msg.hasVoice) {
-              lastBotResponse = "[mensaje de voz]";
               lastAudioEvent = "Mensaje de voz recibido.";
             }
             currentInputPreview = "";
