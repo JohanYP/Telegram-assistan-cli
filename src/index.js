@@ -11,10 +11,8 @@ const USER_DATA_DIR = path.join(__dirname, "..", ".telegram-session");
 const CHAT_CONFIG_PATH = path.join(USER_DATA_DIR, "chat-config.json");
 const POLL_INTERVAL_MS = 1200;
 const HEADLESS_OVERRIDE = process.env.HEADLESS;
-const ENABLE_SYSTEM_AUDIO_FALLBACK_ENV = process.env.ENABLE_SYSTEM_AUDIO_FALLBACK;
 
 let seenIds = new Set();
-let playedAudioUrls = new Set();
 let sessionArmed = false;
 let waitingBotReply = false;
 let lastBotResponse = "Aun sin respuesta.";
@@ -513,29 +511,39 @@ async function playVoice(page, key) {
   let info = await readVoiceState(page, key);
   if (info.state === "pause" || info.state === "missing" || info.state === "error") return;
 
+  const tsBefore = Date.now();
+
   if (info.state === "play") {
     await clickVoiceButton(page, key);
-    return;
-  }
-
-  if (info.state === "download") {
+  } else if (info.state === "download") {
     await clickVoiceButton(page, key);
     // Esperar a que la descarga termine y el estado pase a play.
     for (let i = 0; i < 12; i += 1) {
       await wait(800);
       info = await readVoiceState(page, key);
-      if (info.state === "pause") return;
+      if (info.state === "pause") break;
       if (info.state === "play") {
         await clickVoiceButton(page, key);
-        return;
+        break;
       }
       if (info.state !== "download") break;
     }
-    return;
+  } else {
+    await clickVoiceButton(page, key);
   }
 
-  // unknown / no-wrapper: un click como fallback.
-  await clickVoiceButton(page, key);
+  // En headless el navegador no produce audio audible, asi que ademas leemos
+  // el blob capturado por el fetch hook y lo pasamos a ffplay/mpv.
+  if (SYSTEM_PLAYER) {
+    const audio = await pollForNewAudio(page, tsBefore);
+    if (audio && audio.buf && audio.buf.length >= 200) {
+      playAudioBuffer(audio.buf);
+      lastAudioEvent = `Reproduciendo (${SYSTEM_PLAYER.bin}, ${(audio.buf.length / 1024).toFixed(0)} KB).`;
+    } else {
+      lastAudioEvent = "Click hecho pero no llego ningun blob de audio (timeout).";
+    }
+    renderCliShell(currentInputPreview);
+  }
 }
 
 async function processVoicePending(page) {
@@ -554,150 +562,126 @@ async function processVoicePending(page) {
   }
 }
 
-async function fetchFullAudioFromPage(page, url) {
-  // Re-descarga el archivo completo desde la pagina (con cookies/auth ya
-  // cargadas). Puede fallar si la URL signed expiro, blob: revocado, CORS, etc.
-  const result = await page
-    .evaluate(async (u) => {
-      try {
-        const res = await fetch(u, { credentials: "include" });
-        if (!res.ok) return { dataUrl: null, info: `HTTP ${res.status}` };
-        const blob = await res.blob();
-        const dataUrl = await new Promise((resolve) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result);
-          reader.onerror = () => resolve(null);
-          reader.readAsDataURL(blob);
-        });
-        if (!dataUrl) return { dataUrl: null, info: "FileReader fallo" };
-        return { dataUrl, info: `ok (${blob.size}B, ${blob.type || "?"})` };
-      } catch (e) {
-        return { dataUrl: null, info: `fetch err: ${(e && e.message) || e}` };
-      }
-    }, url)
-    .catch((e) => ({ dataUrl: null, info: `evaluate err: ${e.message}` }));
+// Hook de window.fetch: Telegram Web "/a/" sirve los audios via Service
+// Worker desde IndexedDB con URLs internas tipo
+// /a/progressive/documentXXX. Esas URLs no son resolvibles desde Node ni
+// con un fetch arbitrario (el SW solo responde al <audio> element).
+// Hookeando window.fetch ANTES de que la pagina cargue capturamos el blob
+// real cuando el SW lo entrega.
+const FETCH_HOOK_FN = function () {
+  if (window.__tgFetchHooked) return;
+  window.__tgFetchHooked = true;
+  window.__tgAudioBuffers = window.__tgAudioBuffers || {};
 
-  if (!result.dataUrl) return { buf: null, info: result.info };
-  const idx = result.dataUrl.indexOf(",");
-  if (idx < 0) return { buf: null, info: "dataUrl invalido" };
-  return {
-    buf: Buffer.from(result.dataUrl.slice(idx + 1), "base64"),
-    info: result.info,
-  };
-}
-
-async function fetchFullAudioFromNode(page, url) {
-  // Descarga desde Node con las cookies del browser. Sin CORS, sin Range
-  // header (CDN responde 200 completo). blob:/data: solo en la pagina.
-  if (url.startsWith("blob:") || url.startsWith("data:")) {
-    return { buf: null, info: "URL blob:/data: (no aplicable a Node)" };
-  }
-  try {
-    const cookies = await page.cookies(url).catch(() => []);
-    const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-    const userAgent = await page
-      .evaluate(() => navigator.userAgent)
-      .catch(() => "Mozilla/5.0");
-
-    const headers = { "User-Agent": userAgent };
-    if (cookieStr) headers["Cookie"] = cookieStr;
-
-    const res = await fetch(url, { headers });
-    if (!res.ok) {
-      return { buf: null, info: `HTTP ${res.status}` };
-    }
-    const ab = await res.arrayBuffer();
-    return { buf: Buffer.from(ab), info: `ok (${ab.byteLength}B)` };
-  } catch (e) {
-    return { buf: null, info: `fetch err: ${(e && e.message) || e}` };
-  }
-}
-
-async function installAudioInterceptor(page) {
-  if (!SYSTEM_PLAYER) return;
-
-  const client = await page.target().createCDPSession();
-  await client.send("Network.enable");
-
-  let currentAudioChild = null;
-
-  client.on("Network.responseReceived", async (event) => {
+  const origFetch = window.fetch.bind(window);
+  window.fetch = async function (input, init) {
+    let url = "";
     try {
-      const { response } = event;
-      const url = response.url || "";
-      const headers = response.headers || {};
-      const ct = (headers["content-type"] || headers["Content-Type"] || "").toLowerCase();
+      url = typeof input === "string" ? input : (input && input.url) || "";
+    } catch (_) {}
 
-      const looksAudio =
-        ct.includes("audio/") ||
-        ct.includes("opus") ||
-        /\.(ogg|oga|opus|mp3|m4a|wav)(\?|$)/i.test(url);
+    const resp = await origFetch(input, init);
 
-      const looksTelegramCDN =
-        /telegram|cdn|web\.telegram\.org|t\.me/i.test(url) || url.startsWith("blob:");
+    try {
+      if (resp && resp.ok && url) {
+        const ct = (resp.headers.get("content-type") || "").toLowerCase();
+        const isAudio =
+          ct.includes("audio") ||
+          ct.includes("opus") ||
+          /\.(ogg|oga|opus|mp3|m4a|wav)/i.test(url) ||
+          /progressive\/document/i.test(url);
 
-      if (!looksAudio || !looksTelegramCDN) return;
-      if (playedAudioUrls.has(url)) return;
-      playedAudioUrls.add(url);
-
-      // 1. Descargar desde Node (sin CORS, sin Range). Mas fiable.
-      // 2. Fallback a fetch desde la pagina (cubre blob:).
-      let buf = null;
-      let source = "";
-
-      const nodeRes = await fetchFullAudioFromNode(page, url);
-      if (nodeRes.buf && nodeRes.buf.length >= 200) {
-        buf = nodeRes.buf;
-        source = "node";
-      }
-
-      let pageRes = null;
-      if (!buf) {
-        pageRes = await fetchFullAudioFromPage(page, url);
-        if (pageRes.buf && pageRes.buf.length >= 200) {
-          buf = pageRes.buf;
-          source = "page";
+        if (isAudio) {
+          const cloned = resp.clone();
+          cloned
+            .blob()
+            .then(async (blob) => {
+              if (!blob || blob.size < 200) return;
+              const dataUrl = await new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => resolve(null);
+                reader.readAsDataURL(blob);
+              });
+              if (dataUrl) {
+                window.__tgAudioBuffers[url] = {
+                  dataUrl,
+                  ts: Date.now(),
+                  size: blob.size,
+                };
+              }
+            })
+            .catch(() => {});
         }
       }
+    } catch (_) {}
 
-      if (!buf) {
-        const urlPreview = url.length > 50 ? url.slice(0, 50) + "..." : url;
-        const reason = pageRes
-          ? `node=${nodeRes.info} | page=${pageRes.info}`
-          : `node=${nodeRes.info}`;
-        lastAudioEvent = `Audio fallo. URL=${urlPreview} | ${reason}`;
-        renderCliShell(currentInputPreview);
-        return;
-      }
+    return resp;
+  };
+};
 
-      const file = path.join(os.tmpdir(), `tg-voice-${Date.now()}.ogg`);
-      fs.writeFileSync(file, buf);
+async function installFetchHook(page) {
+  await page.evaluateOnNewDocument(FETCH_HOOK_FN).catch(() => {});
+  await page.evaluate(FETCH_HOOK_FN).catch(() => {});
+}
 
-      // Detener cualquier audio previo para evitar solapamiento.
-      if (currentAudioChild && !currentAudioChild.killed) {
-        try {
-          currentAudioChild.kill("SIGTERM");
-        } catch (_) {}
-      }
+let currentAudioChild = null;
 
-      lastAudioEvent = `Reproduciendo (${SYSTEM_PLAYER.bin}, ${(buf.length / 1024).toFixed(0)} KB, ${source}).`;
-      renderCliShell(currentInputPreview);
+function playAudioBuffer(buf) {
+  if (!SYSTEM_PLAYER || !buf) return false;
+  const file = path.join(os.tmpdir(), `tg-voice-${Date.now()}.ogg`);
+  fs.writeFileSync(file, buf);
 
-      const child = spawn(SYSTEM_PLAYER.bin, [...SYSTEM_PLAYER.args, file], {
-        stdio: "ignore",
-        detached: true,
-      });
-      currentAudioChild = child;
-      child.unref();
+  if (currentAudioChild && !currentAudioChild.killed) {
+    try {
+      currentAudioChild.kill("SIGTERM");
+    } catch (_) {}
+  }
 
-      setTimeout(() => {
-        fs.unlink(file, () => {});
-      }, 5 * 60 * 1000);
-    } catch (err) {
-      lastAudioEvent = `Error de audio: ${err.message}`;
-      renderCliShell(currentInputPreview);
-    }
+  const child = spawn(SYSTEM_PLAYER.bin, [...SYSTEM_PLAYER.args, file], {
+    stdio: "ignore",
+    detached: true,
   });
+  currentAudioChild = child;
+  child.unref();
+
+  setTimeout(() => fs.unlink(file, () => {}), 5 * 60 * 1000);
+  return true;
+}
+
+async function pollForNewAudio(page, sinceTs, timeoutMs = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const result = await page
+      .evaluate((since) => {
+        const buffers = window.__tgAudioBuffers || {};
+        let latest = null;
+        for (const url in buffers) {
+          const entry = buffers[url];
+          if (entry.ts > since) {
+            if (!latest || entry.ts > latest.ts) {
+              latest = { url, dataUrl: entry.dataUrl, ts: entry.ts, size: entry.size };
+            }
+          }
+        }
+        if (latest) delete buffers[latest.url];
+        return latest;
+      }, sinceTs)
+      .catch(() => null);
+
+    if (result && result.dataUrl) {
+      const idx = result.dataUrl.indexOf(",");
+      if (idx >= 0) {
+        return {
+          buf: Buffer.from(result.dataUrl.slice(idx + 1), "base64"),
+          url: result.url,
+          size: result.size,
+        };
+      }
+    }
+    await wait(500);
+  }
+  return null;
 }
 
 function createSpinner() {
@@ -713,7 +697,6 @@ function createSpinner() {
 
 async function runSession() {
   seenIds = new Set();
-  playedAudioUrls = new Set();
   sessionArmed = false;
   waitingBotReply = false;
   lastBotResponse = "Aun sin respuesta.";
@@ -734,11 +717,7 @@ async function runSession() {
   else if (HEADLESS_OVERRIDE === "1") headless = true;
   else headless = !isFirstTime;
 
-  const enableAudioFallback =
-    ENABLE_SYSTEM_AUDIO_FALLBACK_ENV === "1" ||
-    (ENABLE_SYSTEM_AUDIO_FALLBACK_ENV !== "0" && headless);
-
-  if (SYSTEM_PLAYER && enableAudioFallback) {
+  if (SYSTEM_PLAYER && headless) {
     console.log(`Reproductor de audio detectado: ${SYSTEM_PLAYER.bin}. Audio local activado.`);
   } else if (!SYSTEM_PLAYER && headless) {
     console.log(
@@ -761,7 +740,9 @@ async function runSession() {
   const page = pages[0] || (await browser.newPage());
 
   try {
-    if (enableAudioFallback) await installAudioInterceptor(page);
+    // Hook de fetch debe instalarse ANTES de cualquier navegacion para que
+    // capture los responses del Service Worker (audios) desde el inicio.
+    await installFetchHook(page);
 
     if (chatConfig) {
       console.log(`Abriendo chat guardado: ${chatConfig.name}`);
