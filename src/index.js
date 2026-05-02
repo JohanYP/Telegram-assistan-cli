@@ -599,15 +599,45 @@ async function installAutoplayObserver(page) {
   });
 }
 
+async function fetchFullAudioFromPage(page, url) {
+  // Re-descarga el archivo completo desde la pagina para evitar problemas con
+  // Range requests parciales (audios largos llegan en chunks; getResponseBody
+  // solo entrega el chunk actual).
+  const dataUrl = await page
+    .evaluate(async (u) => {
+      try {
+        const res = await fetch(u, { credentials: "include", cache: "no-store" });
+        if (!res.ok) return null;
+        const blob = await res.blob();
+        return await new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => resolve(null);
+          reader.readAsDataURL(blob);
+        });
+      } catch (e) {
+        return null;
+      }
+    }, url)
+    .catch(() => null);
+
+  if (!dataUrl || typeof dataUrl !== "string") return null;
+  const idx = dataUrl.indexOf(",");
+  if (idx < 0) return null;
+  return Buffer.from(dataUrl.slice(idx + 1), "base64");
+}
+
 async function installAudioInterceptor(page) {
   if (!SYSTEM_PLAYER) return;
 
   const client = await page.target().createCDPSession();
   await client.send("Network.enable");
 
+  let currentAudioChild = null;
+
   client.on("Network.responseReceived", async (event) => {
     try {
-      const { requestId, response } = event;
+      const { response } = event;
       const url = response.url || "";
       const headers = response.headers || {};
       const ct = (headers["content-type"] || headers["Content-Type"] || "").toLowerCase();
@@ -624,22 +654,27 @@ async function installAudioInterceptor(page) {
       if (playedAudioUrls.has(url)) return;
       playedAudioUrls.add(url);
 
-      const body = await client
-        .send("Network.getResponseBody", { requestId })
-        .catch(() => null);
-      if (!body || !body.body) return;
+      const buf = await fetchFullAudioFromPage(page, url);
+      if (!buf || buf.length < 200) return;
 
-      const buf = Buffer.from(body.body, body.base64Encoded ? "base64" : "utf8");
       const file = path.join(os.tmpdir(), `tg-voice-${Date.now()}.ogg`);
       fs.writeFileSync(file, buf);
 
-      lastAudioEvent = `Reproduciendo audio local (${SYSTEM_PLAYER.bin})...`;
+      // Detener cualquier audio previo para evitar solapamiento.
+      if (currentAudioChild && !currentAudioChild.killed) {
+        try {
+          currentAudioChild.kill("SIGTERM");
+        } catch (_) {}
+      }
+
+      lastAudioEvent = `Reproduciendo audio local (${SYSTEM_PLAYER.bin}, ${(buf.length / 1024).toFixed(0)} KB)...`;
       renderCliShell(currentInputPreview);
 
       const child = spawn(SYSTEM_PLAYER.bin, [...SYSTEM_PLAYER.args, file], {
         stdio: "ignore",
         detached: true,
       });
+      currentAudioChild = child;
       child.unref();
 
       setTimeout(() => {
