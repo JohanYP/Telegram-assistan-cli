@@ -556,38 +556,42 @@ async function processVoicePending(page) {
 
 async function fetchFullAudioFromPage(page, url) {
   // Re-descarga el archivo completo desde la pagina (con cookies/auth ya
-  // cargadas) para esquivar respuestas Range parciales del CDN. Puede fallar
-  // si la URL signed expiro o es cross-origin sin permisos.
-  const dataUrl = await page
+  // cargadas). Puede fallar si la URL signed expiro, blob: revocado, CORS, etc.
+  const result = await page
     .evaluate(async (u) => {
       try {
         const res = await fetch(u, { credentials: "include" });
-        if (!res.ok) return null;
+        if (!res.ok) return { dataUrl: null, info: `HTTP ${res.status}` };
         const blob = await res.blob();
-        return await new Promise((resolve) => {
+        const dataUrl = await new Promise((resolve) => {
           const reader = new FileReader();
           reader.onload = () => resolve(reader.result);
           reader.onerror = () => resolve(null);
           reader.readAsDataURL(blob);
         });
+        if (!dataUrl) return { dataUrl: null, info: "FileReader fallo" };
+        return { dataUrl, info: `ok (${blob.size}B, ${blob.type || "?"})` };
       } catch (e) {
-        return null;
+        return { dataUrl: null, info: `fetch err: ${(e && e.message) || e}` };
       }
     }, url)
-    .catch(() => null);
+    .catch((e) => ({ dataUrl: null, info: `evaluate err: ${e.message}` }));
 
-  if (!dataUrl || typeof dataUrl !== "string") return null;
-  const idx = dataUrl.indexOf(",");
-  if (idx < 0) return null;
-  return Buffer.from(dataUrl.slice(idx + 1), "base64");
+  if (!result.dataUrl) return { buf: null, info: result.info };
+  const idx = result.dataUrl.indexOf(",");
+  if (idx < 0) return { buf: null, info: "dataUrl invalido" };
+  return {
+    buf: Buffer.from(result.dataUrl.slice(idx + 1), "base64"),
+    info: result.info,
+  };
 }
 
 async function fetchFullAudioFromNode(page, url) {
-  // Descarga el archivo desde Node con las cookies del browser. No hay CORS
-  // (Node no aplica CORS) y al no enviar Range header, el CDN responde con el
-  // archivo entero. URLs blob:/data: solo viven en la pagina, no se pueden
-  // pedir desde fuera.
-  if (url.startsWith("blob:") || url.startsWith("data:")) return null;
+  // Descarga desde Node con las cookies del browser. Sin CORS, sin Range
+  // header (CDN responde 200 completo). blob:/data: solo en la pagina.
+  if (url.startsWith("blob:") || url.startsWith("data:")) {
+    return { buf: null, info: "URL blob:/data: (no aplicable a Node)" };
+  }
   try {
     const cookies = await page.cookies(url).catch(() => []);
     const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
@@ -599,11 +603,13 @@ async function fetchFullAudioFromNode(page, url) {
     if (cookieStr) headers["Cookie"] = cookieStr;
 
     const res = await fetch(url, { headers });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      return { buf: null, info: `HTTP ${res.status}` };
+    }
     const ab = await res.arrayBuffer();
-    return Buffer.from(ab);
-  } catch (_) {
-    return null;
+    return { buf: Buffer.from(ab), info: `ok (${ab.byteLength}B)` };
+  } catch (e) {
+    return { buf: null, info: `fetch err: ${(e && e.message) || e}` };
   }
 }
 
@@ -634,24 +640,32 @@ async function installAudioInterceptor(page) {
       if (playedAudioUrls.has(url)) return;
       playedAudioUrls.add(url);
 
-      // El response interceptado puede ser un Range parcial. Para obtener el
-      // archivo completo:
-      //   1. Descargar desde Node (sin CORS, sin Range header). Mas fiable.
-      //   2. Si falla (URL blob:, error de red), refetch desde la pagina
-      //      con credentials: include.
+      // 1. Descargar desde Node (sin CORS, sin Range). Mas fiable.
+      // 2. Fallback a fetch desde la pagina (cubre blob:).
       let buf = null;
       let source = "";
 
-      buf = await fetchFullAudioFromNode(page, url);
-      if (buf && buf.length >= 200) source = "node";
-
-      if (!buf || buf.length < 200) {
-        buf = await fetchFullAudioFromPage(page, url);
-        if (buf && buf.length >= 200) source = "page";
+      const nodeRes = await fetchFullAudioFromNode(page, url);
+      if (nodeRes.buf && nodeRes.buf.length >= 200) {
+        buf = nodeRes.buf;
+        source = "node";
       }
 
-      if (!buf || buf.length < 200) {
-        lastAudioEvent = "No pude obtener el audio (Node y pagina fallaron).";
+      let pageRes = null;
+      if (!buf) {
+        pageRes = await fetchFullAudioFromPage(page, url);
+        if (pageRes.buf && pageRes.buf.length >= 200) {
+          buf = pageRes.buf;
+          source = "page";
+        }
+      }
+
+      if (!buf) {
+        const urlPreview = url.length > 50 ? url.slice(0, 50) + "..." : url;
+        const reason = pageRes
+          ? `node=${nodeRes.info} | page=${pageRes.info}`
+          : `node=${nodeRes.info}`;
+        lastAudioEvent = `Audio fallo. URL=${urlPreview} | ${reason}`;
         renderCliShell(currentInputPreview);
         return;
       }
