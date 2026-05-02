@@ -21,6 +21,7 @@ let lastBotResponse = "Aun sin respuesta.";
 let lastAudioEvent = "Sin audio reciente.";
 let currentInputPreview = "";
 let currentChatName = "Sin chat seleccionado";
+let forceVisibleNextRun = false;
 
 function detectPlayer() {
   const candidates = [
@@ -176,7 +177,7 @@ function renderCliShell(inputValue = "", spinnerText = "") {
   const audioBox = buildBox("♪ AUDIO", lastAudioEvent, width, 1, 2);
   const statusText = waitingBotReply
     ? spinnerText || "Procesando respuesta del bot..."
-    : "Listo. Enter para enviar. /logout cerrar sesion. /salir terminar.";
+    : "Listo. Enter para enviar. /visible reabrir browser. /logout cerrar sesion. /salir terminar.";
   const inputBox = buildBox("⌨ COMANDO", inputValue || " ", width, 1, 3);
   const statusLine = `● Estado: ${statusText}`.slice(0, width);
 
@@ -426,11 +427,13 @@ async function installAutoplayObserver(page) {
       }
     }
 
-    function findPlayTarget(node) {
+    function findClickable(node) {
       const selectors = [
         "button[aria-label*='Play' i]",
         "button[aria-label*='Reproducir' i]",
         "button[aria-label*='Voice' i]",
+        "button[aria-label*='Download' i]",
+        "button[aria-label*='Descargar' i]",
         "button.toggle-play",
         ".AudioPlayer-playButton",
         ".play-pause-button",
@@ -441,6 +444,12 @@ async function installAutoplayObserver(page) {
         ".Audio button",
         ".voice-message button",
         ".media-inner button",
+        "[class*='download' i] button",
+        "[class*='Download' i]",
+        ".tgico-download",
+        ".icon-download",
+        ".message-media-progress",
+        ".media-photo-progress button",
       ];
       for (const sel of selectors) {
         const el = node.querySelector(sel);
@@ -469,32 +478,44 @@ async function installAutoplayObserver(page) {
       );
     }
 
-    function tryPlay(messageNode) {
-      if (messageNode.dataset && messageNode.dataset.tgPlayedVoice === "1") return false;
+    function forcePlayAudio(messageNode) {
+      const audio = messageNode.querySelector("audio");
+      if (!audio) return false;
+      try {
+        audio.muted = false;
+        audio.volume = 1;
+        audio.play().catch(() => {});
+        return !audio.paused;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function tryPlay(messageNode, attempt) {
+      attempt = attempt || 0;
       const id =
         messageNode.getAttribute("data-message-id") ||
         messageNode.getAttribute("data-mid") ||
         messageNode.id ||
         "";
-      if (id && window.__tgPlayedIds.has(id)) return false;
 
-      const target = findPlayTarget(messageNode);
-      if (!target) return false;
-
-      messageNode.scrollIntoView?.({ block: "center", behavior: "auto" });
-      fireClick(target);
-
-      const audio = messageNode.querySelector("audio");
-      if (audio) {
-        try {
-          audio.muted = false;
-          audio.volume = 1;
-          audio.play().catch(() => {});
-        } catch (_) {}
+      if (attempt === 0) {
+        if (messageNode.dataset && messageNode.dataset.tgPlayedVoice === "1") return false;
+        if (id && window.__tgPlayedIds.has(id)) return false;
+        if (id) window.__tgPlayedIds.add(id);
+        if (messageNode.dataset) messageNode.dataset.tgPlayedVoice = "1";
+        messageNode.scrollIntoView?.({ block: "center", behavior: "auto" });
       }
 
-      if (id) window.__tgPlayedIds.add(id);
-      if (messageNode.dataset) messageNode.dataset.tgPlayedVoice = "1";
+      const target = findClickable(messageNode);
+      if (target) fireClick(target);
+      const playing = forcePlayAudio(messageNode);
+
+      // Reintentos: el primer click suele iniciar la descarga; el siguiente reproduce.
+      // Hasta 4 intentos espaciados ~700ms para cubrir descarga lenta + segundo click de play.
+      if (!playing && attempt < 4) {
+        setTimeout(() => tryPlay(messageNode, attempt + 1), 700);
+      }
       return true;
     }
 
@@ -610,7 +631,10 @@ async function runSession() {
   const isFirstTime = !chatConfig;
 
   let headless;
-  if (HEADLESS_OVERRIDE === "0") headless = false;
+  if (forceVisibleNextRun) {
+    headless = false;
+    forceVisibleNextRun = false;
+  } else if (HEADLESS_OVERRIDE === "0") headless = false;
   else if (HEADLESS_OVERRIDE === "1") headless = true;
   else headless = !isFirstTime;
 
@@ -742,6 +766,15 @@ async function runSession() {
           return resolve("logout");
         }
 
+        if (text === "/visible") {
+          rl.close();
+          resolved = true;
+          console.log("\nReiniciando en modo visible (sin borrar sesion)...");
+          await cleanup();
+          forceVisibleNextRun = true;
+          return resolve("restart-visible");
+        }
+
         currentInputPreview = text;
         renderCliShell(currentInputPreview);
         await submitMessage(text);
@@ -808,10 +841,10 @@ async function main() {
     if (result === "exit") {
       process.exit(0);
     }
-    if (result !== "logout") {
+    if (result !== "logout" && result !== "restart-visible") {
       process.exit(0);
     }
-    // logout -> volver a iniciar el flujo
+    // logout o restart-visible -> volver a iniciar el flujo
   }
 }
 

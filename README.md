@@ -11,6 +11,7 @@ CLI para hablar con cualquier chat o bot de Telegram desde la terminal, automati
 - Muestra en terminal las respuestas de texto.
 - Detecta mensajes de voz entrantes y los reproduce automaticamente (en el navegador o, si estas en headless, vuelca el audio a `ffplay`/`mpv`/`paplay`).
 - Comandos especiales:
+  - `/visible` — reinicia el browser en modo visible (sin borrar sesion ni chat). Util para depurar.
   - `/logout` — cierra sesion, borra cookies + chat guardado y reinicia el flujo (login + seleccion de chat).
   - `/salir` — cierra el CLI.
 - Interfaz responsiva al tamano del terminal (banner compacto y panel de bot opcional segun ancho/alto).
@@ -31,6 +32,12 @@ npm install
 
 ```bash
 npm start
+```
+
+Para depurar con el browser visible (sin headless):
+
+```bash
+npm run debug
 ```
 
 Primer arranque:
