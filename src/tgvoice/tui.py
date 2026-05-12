@@ -199,6 +199,8 @@ class ConfigScreen(ModalScreen[dict | None]):
 
 
 class TgvoiceApp(App):
+    ENABLE_COMMAND_PALETTE = False  # liberamos Ctrl+P para nuestro modal de config
+
     CSS = """
     Screen { background: $surface; }
 
