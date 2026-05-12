@@ -223,7 +223,7 @@ class TgvoiceApp(App):
 
     BINDINGS = [
         Binding("ctrl+c", "quit", "salir", priority=True),
-        Binding("escape", "cancel_recording", "cancelar voz", priority=True),
+        Binding("escape", "cancel_recording", "cancelar voz"),
         Binding("ctrl+w", "toggle_wake", "voz on/off"),
         Binding("ctrl+p", "open_config", "config"),
         Binding("ctrl+l", "clear_chat", "limpiar"),
