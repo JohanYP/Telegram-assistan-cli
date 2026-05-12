@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import zipfile
 from pathlib import Path
 from urllib.request import urlretrieve
@@ -20,11 +21,18 @@ SAMPLE_RATE = 16_000
 class WakeWord:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        self._stop = threading.Event()
 
-    async def listen(self) -> None:
-        await asyncio.to_thread(self._listen_blocking)
+    async def listen(self) -> bool:
+        """Espera a que se diga la wake word. Devuelve True si se detectó,
+        False si fue cancelada vía `cancel()`."""
+        self._stop.clear()
+        return await asyncio.to_thread(self._listen_blocking)
 
-    def _listen_blocking(self) -> None:
+    def cancel(self) -> None:
+        self._stop.set()
+
+    def _listen_blocking(self) -> bool:
         raise NotImplementedError
 
 
@@ -59,7 +67,7 @@ class OpenWakeWordBackend(WakeWord):
             )
         log.info("openWakeWord lista: %s", settings.wake_word)
 
-    def _listen_blocking(self) -> None:
+    def _listen_blocking(self) -> bool:
         threshold = self._settings.wake_threshold
         word = self._settings.wake_word
         with sd.RawInputStream(
@@ -69,13 +77,16 @@ class OpenWakeWordBackend(WakeWord):
             channels=1,
             device=self._settings.input_device,
         ) as stream:
-            while True:
+            while not self._stop.is_set():
                 data, _overflowed = stream.read(self.FRAME_SAMPLES)
+                if self._stop.is_set():
+                    return False
                 arr = np.frombuffer(bytes(data), dtype=np.int16)
                 preds = self._model.predict(arr)
                 if preds.get(word, 0.0) >= threshold:
                     self._model.reset()
-                    return
+                    return True
+        return False
 
 
 class VoskBackend(WakeWord):
@@ -129,7 +140,7 @@ class VoskBackend(WakeWord):
         finally:
             zip_path.unlink(missing_ok=True)
 
-    def _listen_blocking(self) -> None:
+    def _listen_blocking(self) -> bool:
         import vosk
         rec = vosk.KaldiRecognizer(self._model, SAMPLE_RATE, self._grammar)
         with sd.RawInputStream(
@@ -139,13 +150,16 @@ class VoskBackend(WakeWord):
             channels=1,
             device=self._settings.input_device,
         ) as stream:
-            while True:
+            while not self._stop.is_set():
                 data, _overflowed = stream.read(self.FRAME_SAMPLES)
+                if self._stop.is_set():
+                    return False
                 if rec.AcceptWaveform(bytes(data)):
                     result = json.loads(rec.Result())
                     text = result.get("text", "").strip().lower()
                     if text and self._wake_phrase in text:
-                        return
+                        return True
+        return False
 
 
 def make_wake_word(settings: Settings) -> WakeWord:

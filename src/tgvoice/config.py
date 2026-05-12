@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 
-@dataclass(frozen=True)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ENV_PATH = PROJECT_ROOT / ".env"
+
+
+@dataclass
 class Settings:
     api_id: int
     api_hash: str
@@ -15,6 +20,7 @@ class Settings:
     wake_backend: str  # "openwakeword" | "vosk"
     wake_word: str
     wake_threshold: float
+    wake_enabled: bool
     vosk_lang: str  # "es" | "en"
     vad_aggressiveness: int
     silence_timeout_ms: int
@@ -34,15 +40,23 @@ def _require(name: str) -> str:
     return value
 
 
+def _parse_bool(raw: str, default: bool) -> bool:
+    s = raw.strip().lower()
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    return default
+
+
 def load() -> Settings:
-    project_root = Path(__file__).resolve().parents[2]
     # Cargamos el .env desde la raíz del proyecto explícitamente para que
     # `tgvoice` funcione desde cualquier cwd (por ejemplo, vía symlink en
     # ~/.local/bin) sin depender del directorio donde se invoque.
     # override=True: el .env siempre gana sobre variables del shell, así
     # un API_ID exportado vacío en .bashrc no enmascara el valor real.
-    load_dotenv(project_root / ".env", override=True)
-    cache_dir = project_root / ".cache"
+    load_dotenv(ENV_PATH, override=True)
+    cache_dir = PROJECT_ROOT / ".cache"
     cache_dir.mkdir(exist_ok=True)
 
     try:
@@ -65,11 +79,52 @@ def load() -> Settings:
         wake_backend=backend,
         wake_word=os.environ.get("WAKE_WORD", "hey_jarvis").strip(),
         wake_threshold=float(os.environ.get("WAKE_THRESHOLD", "0.5")),
+        wake_enabled=_parse_bool(os.environ.get("WAKE_ENABLED", "true"), True),
         vosk_lang=os.environ.get("VOSK_LANG", "es").strip().lower(),
         vad_aggressiveness=int(os.environ.get("VAD_AGGRESSIVENESS", "2")),
         silence_timeout_ms=int(os.environ.get("SILENCE_TIMEOUT_MS", "1500")),
         max_recording_s=int(os.environ.get("MAX_RECORDING_S", "15")),
         input_device=input_device,
-        session_path=project_root / "tgvoice.session",
+        session_path=PROJECT_ROOT / "tgvoice.session",
         cache_dir=cache_dir,
     )
+
+
+def save_env(updates: dict[str, str]) -> None:
+    """Actualiza claves en `.env` de forma atómica preservando comentarios y orden.
+
+    - Reemplaza líneas existentes que empiecen con `KEY=`.
+    - Añade al final las claves nuevas.
+    """
+    if not updates:
+        return
+
+    remaining = dict(updates)
+    new_lines: list[str] = []
+
+    if ENV_PATH.exists():
+        with ENV_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.lstrip()
+                if stripped and not stripped.startswith("#") and "=" in stripped:
+                    key = stripped.split("=", 1)[0].strip()
+                    if key in remaining:
+                        new_lines.append(f"{key}={remaining.pop(key)}\n")
+                        continue
+                new_lines.append(line)
+
+    if remaining:
+        if new_lines and not new_lines[-1].endswith("\n"):
+            new_lines.append("\n")
+        for key, value in remaining.items():
+            new_lines.append(f"{key}={value}\n")
+
+    # Escritura atómica: tmp en el mismo dir + rename.
+    fd, tmp_path = tempfile.mkstemp(prefix=".env.", dir=str(PROJECT_ROOT))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+        os.replace(tmp_path, ENV_PATH)
+    except Exception:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
